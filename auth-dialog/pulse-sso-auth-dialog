@@ -16,11 +16,49 @@ import argparse
 import hashlib
 import os
 import select
+import signal
 import socket
 import ssl
 import subprocess
 import sys
 import time
+
+
+# PID of the running CEF browser subprocess, tracked so the SIGTERM/SIGINT
+# handler below can SIGKILL it (and all its renderer/GPU children) before
+# this script exits. CEF is launched in its own process group so a single
+# killpg takes down the entire tree. Without this, auth-dialog would die
+# (no Python signal handler → default OS termination) and CEF would be
+# left orphaned — the systemd transient-unit cgroup cleanup that nominally
+# tears down the unit is unreliable when systemd-run --pipe --wait is
+# itself signaled, so we cannot count on it.
+_cef_pid: "int | None" = None
+
+
+def _terminate_handler(signum, _frame):
+    """Kill the CEF process group immediately, then exit.
+
+    Called when the VPN service or systemd-run sends SIGTERM/SIGINT to
+    cancel an in-progress browser auth. SIGKILL the whole process group
+    (CEF main + renderer/GPU/utility children) for prompt teardown — there
+    is no graceful state to preserve. os._exit skips Python cleanup, which
+    is the only safe way to exit from a signal handler.
+    """
+    global _cef_pid
+    pid = _cef_pid
+    if pid:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (OSError, ProcessLookupError):
+                pass
+    os._exit(128 + signum)
+
+
+signal.signal(signal.SIGTERM, _terminate_handler)
+signal.signal(signal.SIGINT, _terminate_handler)
 
 
 def get_server_cert_fingerprint(hostname: str, port: int = 443) -> str:
@@ -106,29 +144,45 @@ def get_dsid_via_cef(vpn_url: str, cef_binary: str, timeout: int = 300) -> str:
     Raises:
         Exception if authentication fails or times out
     """
+    global _cef_pid
+    cmd = [cef_binary, "--url", vpn_url, "--timeout", str(timeout)]
+
+    # Use Popen (instead of subprocess.run) so the SIGTERM/SIGINT handler
+    # can find the CEF pid and kill its process group when this script is
+    # signaled mid-auth. start_new_session puts CEF in its own group/session
+    # so a single killpg tears down CEF's renderer/GPU children too.
+    cef_proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    _cef_pid = cef_proc.pid
+
     try:
-        cmd = [cef_binary, "--url", vpn_url, "--timeout", str(timeout)]
+        try:
+            stdout, stderr = cef_proc.communicate(timeout=timeout + 10)
+        except subprocess.TimeoutExpired:
+            cef_proc.kill()
+            try:
+                cef_proc.communicate(timeout=5)
+            except Exception:
+                pass
+            raise Exception(f"Authentication timed out after {timeout} seconds")
 
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout + 10,  # Give extra time for subprocess overhead
-        )
+        rc = cef_proc.returncode
+        if rc != 0:
+            stderr_text = (stderr or "").strip()
+            raise Exception(f"CEF authentication failed: {stderr_text}")
 
-        if result.returncode != 0:
-            stderr = result.stderr.strip()
-            raise Exception(f"CEF authentication failed: {stderr}")
-
-        # Parse output - expected format: DSID=<cookie-value>
-        output = result.stdout.strip()
+        output = (stdout or "").strip()
         if output.startswith("DSID="):
-            return output[5:]  # Strip "DSID=" prefix
+            return output[5:]
         else:
             raise Exception(f"Unexpected CEF output: {output}")
-
-    except subprocess.TimeoutExpired:
-        raise Exception(f"Authentication timed out after {timeout} seconds")
+    finally:
+        _cef_pid = None
 
 
 def main():

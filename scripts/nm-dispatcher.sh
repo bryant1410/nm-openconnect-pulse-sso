@@ -133,13 +133,14 @@ if [ -z "$TARGET_GW" ] || [ -z "$TARGET_DEV" ]; then
                         sleep 1
                         GW=$(@iproute2@/bin/ip route show default dev "$dev" 2>/dev/null | @gawk@/bin/awk '{print $3}' | head -1)
                         if [ -z "$GW" ]; then
-                            log_msg "Reapply failed — bouncing $dev connection"
-                            CONN=$(@networkmanager@/bin/nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null | grep ":${dev}$" | head -1 | cut -d: -f1)
-                            if [ -n "$CONN" ]; then
-                                @networkmanager@/bin/nmcli connection down "$CONN" 2>/dev/null || true
-                                sleep 1
-                                @networkmanager@/bin/nmcli connection up "$CONN" 2>/dev/null || true
-                            fi
+                            # Previously bounced the connection here (nmcli down/up).
+                            # That worked around an older NM/dock issue where the new
+                            # interface never finished activation, but it left NM in a
+                            # state where the VPN service's reactivation kept failing
+                            # with "base device not active" until the next interface
+                            # event — a 70+ second deadlock. The VPN service now has
+                            # a fallback retry, so let NM settle on its own.
+                            log_msg "Reapply did not restore default route — letting NM settle (VPN fallback retry will pick it up)"
                         fi
                     fi
                     break

@@ -222,6 +222,13 @@ class PulseSSOPlugin(dbus.service.Object):
         self._reactivation_retry_count: int = 0
         self._max_reactivation_retries: int = 10  # ×2s = 20s max window
 
+        # Slow-path fallback: when the 20s retry window expires, schedule one
+        # more attempt this far out before truly giving up. Covers docks/USB
+        # ethernet that take longer than 20s to settle and avoids deadlocking
+        # waiting for an interface event that may never come.
+        self._reactivation_fallback_delay_ms: int = 30_000
+        self._reactivation_fallback_done: bool = False
+
         # UUID of the VPN connection that was originally activated via
         # Connect/ConnectInteractive. Used by _reactivate_vpn_via_nm() to
         # re-activate the correct connection when duplicates exist.
@@ -268,6 +275,14 @@ class PulseSSOPlugin(dbus.service.Object):
         self._auth_dialog_child_watch_id: Optional[int] = None
         self._auth_dialog_timeout_id: Optional[int] = None
 
+        # Transient unit name and target user for the active auth-dialog
+        # systemd-run invocation. Set when launching, used to explicitly stop
+        # the unit on disconnect — systemd's stop tears down the cgroup
+        # reliably, unlike SIGTERMing systemd-run which often does not.
+        self._auth_unit_name: Optional[str] = None
+        self._auth_unit_user: Optional[str] = None
+        self._auth_unit_uses_machine: bool = False
+
         # State for async auth-dialog launch fallback chain
         self._auth_launch_commands: list = []
         self._auth_launch_index: int = 0
@@ -290,6 +305,12 @@ class PulseSSOPlugin(dbus.service.Object):
 
         # Timestamp of last resume from suspend — used for stabilization delay
         self._resume_timestamp: float = 0
+
+        # Monotonic timestamp of the most recent StateChanged(Starting) emission.
+        # NM's state machine sometimes fires Disconnect() within ~hundreds of ms
+        # of a Starting emission; the timestamp lets Disconnect() distinguish
+        # that quirk from a genuine user-initiated disconnect.
+        self._last_starting_ts: float = 0.0
 
         # Count system-readiness failures (D-Bus, DNS, network) separately from
         # auth failures.  These are transient and should not burn the global cap.
@@ -406,7 +427,7 @@ class PulseSSOPlugin(dbus.service.Object):
                 gateway = f"https://{gateway}"
 
             logger.info("Starting openconnect for gateway: %s", gateway)
-            self.StateChanged(ServiceState.Starting)
+            self._emit_starting()
 
             self.gateway = gateway
             self.cookie = cookie
@@ -722,7 +743,7 @@ class PulseSSOPlugin(dbus.service.Object):
                 self.cookie = None
                 if self.gateway and not self._disconnect_requested:
                     self._reconnection_pending = True
-                    self.StateChanged(ServiceState.Starting)
+                    self._emit_starting()
                     self._schedule_direct_auth(1000)
                 else:
                     self.StateChanged(ServiceState.Stopped)
@@ -834,9 +855,28 @@ class PulseSSOPlugin(dbus.service.Object):
                 self._reactivation_timeout_id = GLib.timeout_add(
                     2000, self._reactivate_vpn_via_nm
                 )
+            elif (not self._disconnect_requested
+                  and not self._reactivation_fallback_done):
+                # Fast retry budget exhausted but NM still hasn't promoted
+                # the new base device. Schedule one more attempt further out
+                # so a slow-settling dock/USB-ethernet stack can finish on
+                # its own — without this, the service goes idle and waits
+                # for an interface event that may never come.
+                self._reactivation_fallback_done = True
+                logger.info(
+                    "Re-activation failed (%s) after %d fast retries — "
+                    "scheduling fallback attempt in %dms",
+                    e,
+                    self._max_reactivation_retries,
+                    self._reactivation_fallback_delay_ms,
+                )
+                self._reactivation_timeout_id = GLib.timeout_add(
+                    self._reactivation_fallback_delay_ms,
+                    self._reactivate_vpn_via_nm,
+                )
             else:
                 logger.error(
-                    "Failed to re-activate VPN after %d attempt(s): %s",
+                    "Failed to re-activate VPN after %d attempt(s) + fallback: %s",
                     self._reactivation_retry_count + 1,
                     e,
                 )
@@ -919,31 +959,100 @@ class PulseSSOPlugin(dbus.service.Object):
             self._direct_auth_timeout_id = None
 
     def _kill_auth_dialog(self):
-        """Kill any running auth-dialog subprocess and clean up.
+        """Kill any running auth-dialog subprocess and the CEF browser.
 
-        Since auth-dialog is launched via systemd-run --pipe --wait, killing the
-        systemd-run process causes systemd to stop the transient unit and its
-        cgroup, which terminates the auth-dialog and CEF browser.
+        Multiple layers of defense, since each can fail independently:
 
-        Uses SIGTERM first to let systemd-run stop the transient unit properly
-        (and its cgroup, cleaning up CEF), then SIGKILL as fallback.
+        1. systemctl stop on the transient unit (primary): goes through
+           systemd's full stop sequence which guarantees cgroup teardown,
+           taking down auth-dialog AND CEF browser children.
+
+        2. SIGTERM the systemd-run process: nominally tells the unit to
+           stop, but in practice systemd-run often exits in milliseconds
+           after SIGTERM without actually forwarding it.
+
+        3. SIGKILL by name (pkill -f): hard backstop that doesn't depend
+           on systemd at all.
+
+        4. The auth-dialog Python itself installs a SIGTERM/SIGINT handler
+           that killpg's the CEF process group before exiting (works only
+           if step 1 or 2 actually delivers SIGTERM to auth-dialog).
         """
+        # Layer 1 — explicit systemctl stop, the only reliable path.
+        unit = self._auth_unit_name
+        if unit:
+            stop_cmd = ["systemctl"]
+            if self._auth_unit_uses_machine and self._auth_unit_user:
+                stop_cmd += ["--user", f"--machine={self._auth_unit_user}@"]
+            stop_cmd += ["stop", unit]
+            try:
+                result = subprocess.run(
+                    stop_cmd, capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    logger.info("Stopped transient unit %s", unit)
+                else:
+                    logger.info(
+                        "systemctl stop %s rc=%d stderr=%s",
+                        unit, result.returncode, result.stderr.strip(),
+                    )
+            except Exception as e:
+                logger.debug("systemctl stop %s failed: %s", unit, e)
+            self._auth_unit_name = None
+            self._auth_unit_user = None
+            self._auth_unit_uses_machine = False
+
+        # Layer 2 — SIGTERM systemd-run (cooperative path).
         proc = self._auth_dialog_proc
         if proc is not None:
             logger.info("Killing auth-dialog subprocess PID %d", proc.pid)
             try:
-                proc.terminate()  # SIGTERM — lets systemd-run stop transient unit
+                proc.terminate()
                 try:
                     proc.wait(timeout=2)
                 except subprocess.TimeoutExpired:
-                    proc.kill()  # SIGKILL as fallback
+                    proc.kill()
             except OSError:
-                pass  # Process may have already exited
+                pass
             self._auth_dialog_proc = None
+
+        # Layer 3 — SIGKILL by name. Catches stragglers including stale
+        # CEF processes from a previous run that were never reaped. Logs
+        # what was killed so we can see at runtime whether the pattern
+        # actually matches.
+        for pattern in ("pulse-sso-auth-dialog", "pulse-browser-auth"):
+            try:
+                result = subprocess.run(
+                    ["pkill", "-KILL", "-echo", "-f", pattern],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if result.returncode == 0:
+                    killed = result.stdout.strip().replace("\n", "; ")
+                    logger.info("pkill -f %s killed: %s", pattern, killed)
+                elif result.returncode == 1:
+                    logger.debug("pkill -f %s: no matches", pattern)
+                else:
+                    logger.warning(
+                        "pkill -f %s rc=%d stderr=%s",
+                        pattern, result.returncode, result.stderr.strip(),
+                    )
+            except Exception as e:
+                logger.debug("pkill %s failed (non-fatal): %s", pattern, e)
 
         if self._auth_dialog_timeout_id is not None:
             GLib.source_remove(self._auth_dialog_timeout_id)
             self._auth_dialog_timeout_id = None
+
+    def _emit_starting(self):
+        """Emit StateChanged(Starting) and record monotonic timestamp.
+
+        NM's state machine sometimes fires Disconnect() within ~hundreds of ms
+        of a Starting emission as part of its activation cycle. The timestamp
+        lets Disconnect() tell that quirk apart from a genuine user disconnect
+        when the auth dialog is active.
+        """
+        self._last_starting_ts = time.monotonic()
+        self.StateChanged(ServiceState.Starting)
 
     def _launch_direct_auth(self) -> bool:
         """
@@ -1230,13 +1339,25 @@ class PulseSSOPlugin(dbus.service.Object):
             if xauthority:
                 env_args.append(f"--setenv=XAUTHORITY={xauthority}")
 
-            # Store launch commands for the async fallback chain
+            # Generate a deterministic transient-unit name for systemctl stop.
+            # Each launch gets a fresh name so we can target only the current
+            # unit even if a stale one was orphaned.
+            unit_name = f"pulse-sso-auth-{os.getpid()}-{int(time.monotonic() * 1000)}.service"
+            self._auth_unit_name = unit_name
+            self._auth_unit_user = user
+
+            # Store launch commands for the async fallback chain. --unit lets us
+            # call `systemctl stop <unit>` later for guaranteed cgroup teardown.
+            # --collect makes systemd remove the unit even on failed exit so
+            # we don't accumulate failed transient units.
             self._auth_launch_commands = [
                 # Primary path: use user manager via machine bridge.
                 [
                     "systemd-run",
                     "--user",
                     f"--machine={user}@",
+                    f"--unit={unit_name}",
+                    "--collect",
                     "--pipe",
                     "--wait",
                     "--quiet",
@@ -1249,6 +1370,8 @@ class PulseSSOPlugin(dbus.service.Object):
                     "systemd-run",
                     "--user",
                     f"--machine={user}@.host",
+                    f"--unit={unit_name}",
+                    "--collect",
                     "--pipe",
                     "--wait",
                     "--quiet",
@@ -1259,6 +1382,8 @@ class PulseSSOPlugin(dbus.service.Object):
                 # Fallback: launch through the system manager as the target UID.
                 [
                     "systemd-run",
+                    f"--unit={unit_name}",
+                    "--collect",
                     "--pipe",
                     "--wait",
                     "--quiet",
@@ -1355,6 +1480,11 @@ class PulseSSOPlugin(dbus.service.Object):
 
             # Store the proc so Disconnect() can kill it
             self._auth_dialog_proc = proc
+
+            # Strategies 0 & 1 use --user --machine, strategy 2 (uid-based) goes
+            # to the system manager. Track which so the kill path can pick the
+            # right systemctl invocation.
+            self._auth_unit_uses_machine = self._auth_launch_index < 2
 
             # Monitor the process asynchronously via GLib
             self._auth_dialog_child_watch_id = GLib.child_watch_add(
@@ -1501,7 +1631,7 @@ class PulseSSOPlugin(dbus.service.Object):
         self._cookie_is_fresh = True
         self.servercert = gwcert
 
-        self.StateChanged(ServiceState.Starting)
+        self._emit_starting()
         try:
             self._start_openconnect()
             # Only clear reconnection state AFTER openconnect starts successfully
@@ -1573,7 +1703,7 @@ class PulseSSOPlugin(dbus.service.Object):
             self._reconnection_pending = True
             self._reconnection_retry_count = 0
 
-            self.StateChanged(ServiceState.Starting)
+            self._emit_starting()
 
             # Launch direct auth immediately (will open browser)
             self._schedule_direct_auth(0)
@@ -1649,12 +1779,12 @@ class PulseSSOPlugin(dbus.service.Object):
                 )
                 self._reconnection_pending = True
                 self._reconnection_retry_count = 0
-                self.StateChanged(ServiceState.Starting)
+                self._emit_starting()
                 return
 
             self._reconnection_pending = True
             self._reconnection_retry_count = 0
-            self.StateChanged(ServiceState.Starting)
+            self._emit_starting()
             self._schedule_direct_auth(0)
             return
 
@@ -1725,41 +1855,134 @@ class PulseSSOPlugin(dbus.service.Object):
                 GLib.source_remove(self._reactivation_timeout_id)
                 self._reactivation_timeout_id = None
                 self._disconnect_requested = True
+
+                # Tear down auth dialog / CEF and any scheduled launch so
+                # nothing survives the quit.
+                self._cancel_direct_auth_timer()
+                self._kill_auth_dialog()
+                self._reconnection_pending = False
+
+                # Remove auto-reconnect flag so external service does not retry
+                try:
+                    os.unlink("/run/vpn-auto-reconnect")
+                except FileNotFoundError:
+                    pass
+
                 self.cookie = None
                 self.gateway = None
+                self.servercert = None
+                self.pending_connection = None
+
+                self._clear_cached_secrets()
                 self.StateChanged(ServiceState.Stopped)
                 self.loop.quit()
                 return
 
-            # If auth dialog is running or scheduled, preserve it.
-            # NM's Disconnect/re-activate cycle would otherwise kill the dialog
-            # and launch a new one, causing duplicate auth popups.
-            # Note: NM's state machine sends Disconnect() in reaction to
-            # StateChanged(Starting) emitted from Connect(), so this path
-            # is hit during normal reconnection — not just user disconnect.
+            # If auth dialog is running or scheduled, distinguish between:
+            #   (a) NM's state machine quirk: it fires Disconnect() within
+            #       ~hundreds of ms of our StateChanged(Starting) as part of
+            #       the activation cycle. Preserve the auth flow and schedule
+            #       re-activation for NM, otherwise we'd kill the dialog and
+            #       launch a new one causing duplicate auth popups.
+            #   (b) User-initiated disconnect during browser auth: the user
+            #       clicked Disconnect while the CEF window was open. Cancel
+            #       the auth flow, kill CEF, stop the service.
+            # We use elapsed-time-since-last-Starting as the discriminator:
+            # NM's quirk is fast (sub-second), users react in seconds.
             if self._auth_dialog_proc is not None or self._direct_auth_timeout_id is not None:
+                if self._last_starting_ts:
+                    elapsed = time.monotonic() - self._last_starting_ts
+                else:
+                    elapsed = 999.0  # No Starting recorded — treat as user
+
+                # Threshold: the NM Starting→Disconnect quirk fires within
+                # ~hundreds of ms. Realistic user reaction (see browser, decide,
+                # click) is at least ~1.5s. 1.0s is comfortably above the quirk
+                # and below human reaction. Observed user disconnect at 1.80s
+                # was previously misclassified at the old 2.0s threshold.
+                USER_CANCEL_THRESHOLD = 1.0
+
+                if elapsed < USER_CANCEL_THRESHOLD:
+                    logger.info(
+                        "Disconnect %.2fs after Starting (auth dialog active) — "
+                        "preserving auth flow, scheduling re-activation for NM",
+                        elapsed,
+                    )
+                    self.StateChanged(ServiceState.Stopped)
+                    if self._reactivation_timeout_id is not None:
+                        GLib.source_remove(self._reactivation_timeout_id)
+                    self._reactivation_retry_count = 0
+                    self._reactivation_fallback_done = False
+                    self._is_reactivation = True
+                    if self._needs_post_disruption_delay:
+                        delay = 8000  # 8s for server session cleanup
+                        self._needs_post_disruption_delay = False
+                        logger.info(
+                            "Using extended %dms delay for server session cleanup "
+                            "(auth dialog active)",
+                            delay,
+                        )
+                    else:
+                        delay = 500
+                    self._reactivation_timeout_id = GLib.timeout_add(
+                        delay, self._reactivate_vpn_via_nm
+                    )
+                    return
+
+                # User-initiated disconnect during auth — cancel everything.
+                # Mirrors the user-disconnect path further below (proc != None
+                # branch), minus the openconnect kill which doesn't apply here.
                 logger.info(
-                    "Disconnect during active auth — preserving auth flow, "
-                    "scheduling re-activation for NM"
+                    "Disconnect %.2fs after Starting (auth dialog active) — "
+                    "treating as user disconnect, cancelling auth",
+                    elapsed,
                 )
-                self.StateChanged(ServiceState.Stopped)
+                self._disconnect_requested = True
+
+                # Remove auto-reconnect flag so external service does not retry
+                try:
+                    os.unlink("/run/vpn-auto-reconnect")
+                except FileNotFoundError:
+                    pass
+
+                # Cancel any pending re-activation timer
                 if self._reactivation_timeout_id is not None:
                     GLib.source_remove(self._reactivation_timeout_id)
+                    self._reactivation_timeout_id = None
+
+                # Cancel idle-quit timer if armed
+                if self._idle_quit_timeout_id is not None:
+                    GLib.source_remove(self._idle_quit_timeout_id)
+                    self._idle_quit_timeout_id = None
+
+                # Stop auth flow: cancel scheduled launches and kill running
+                # dialog/CEF (systemd-run cgroup cleanup takes CEF down with
+                # the unit when SIGTERM is sent).
+                self._cancel_direct_auth_timer()
+                self._kill_auth_dialog()
+
+                # Reset auth/retry counters tied to this connection lifecycle.
+                # _total_auth_launch_failures is intentionally cumulative, do NOT reset.
+                self._reconnection_pending = False
+                self._reconnection_retry_count = 0
                 self._reactivation_retry_count = 0
-                self._is_reactivation = True
-                if self._needs_post_disruption_delay:
-                    delay = 8000  # 8s for server session cleanup
-                    self._needs_post_disruption_delay = False
-                    logger.info(
-                        "Using extended %dms delay for server session cleanup "
-                        "(auth dialog active)",
-                        delay,
-                    )
-                else:
-                    delay = 500
-                self._reactivation_timeout_id = GLib.timeout_add(
-                    delay, self._reactivate_vpn_via_nm
-                )
+                self._reactivation_fallback_done = False
+                self._consecutive_restart_failures = 0
+                self._auth_failure_count = 0
+                self._needs_post_disruption_delay = False
+
+                # Clear connection-scoped state
+                self.cookie = None
+                self.gateway = None
+                self.servercert = None
+                self.pending_connection = None
+
+                # Drop any cached secret in NM so a future Connect prompts fresh auth
+                self._clear_cached_secrets()
+
+                self.StateChanged(ServiceState.Stopped)
+                logger.info("Stopping service event loop (user disconnect during auth)")
+                self.loop.quit()
                 return
 
             logger.info("Disconnect called but openconnect already exited — "
@@ -1784,6 +2007,7 @@ class PulseSSOPlugin(dbus.service.Object):
             if should_reactivate:
                 logger.info("Scheduling VPN re-activation through NetworkManager")
                 self._reactivation_retry_count = 0
+                self._reactivation_fallback_done = False
                 self._is_reactivation = True
                 if self._needs_post_disruption_delay:
                     delay = 8000  # 8s for server session cleanup
