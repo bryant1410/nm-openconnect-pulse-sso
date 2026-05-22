@@ -189,6 +189,23 @@ class PulseSSOPlugin(dbus.service.Object):
     (which got them from the auth-dialog) and runs openconnect.
     """
 
+    # NM's state machine reflexively fires Disconnect() within a few hundred
+    # ms of a StateChanged(Starting) emitted during a (re)activation cycle. A
+    # Disconnect() arriving sooner than this many seconds after our last
+    # Starting — while openconnect has not yet reported a live tunnel — is that
+    # quirk, not a user action. Realistic user reaction time is >= ~1.5s.
+    USER_CANCEL_THRESHOLD = 1.0
+
+    # Cap on how many times we rescue the NM activation-cycle quirk for a
+    # single openconnect launch before giving up, so a never-settling NM
+    # state cannot spin an infinite quirk -> re-activate -> quirk loop.
+    MAX_QUIRK_RESCUES = 3
+
+    # A real Pulse session DSID is a long hex token (~32 chars). Anything much
+    # shorter is the transient placeholder DSID set during the early SAML
+    # redirect (observed: "DSID=1") — never a usable session cookie.
+    MIN_DSID_LEN = 16
+
     def __init__(self, loop, conn, object_path, bus_name, helper_script):
         super().__init__(conn=conn, object_path=object_path, bus_name=bus_name)
         self.loop = loop
@@ -289,6 +306,23 @@ class PulseSSOPlugin(dbus.service.Object):
         self._auth_unit_user: Optional[str] = None
         self._auth_unit_uses_machine: bool = False
 
+        # Loopback port currently redirected to the browser-auth MITM proxy
+        # by an iptables rule we installed. None when no auth session is
+        # active. Each session picks a fresh kernel-assigned ephemeral port
+        # to avoid fixed-port conflicts with dev tooling.
+        self._proxy_nat_port: Optional[int] = None
+
+        # Watchdog state for openconnect dead-transport detection. When the
+        # gateway becomes unroutable (e.g. an interface migration that
+        # produced no clean NM dispatcher 'down' event — wifi roam, dock
+        # swap), openconnect floods 'Network is unreachable' on every ESP
+        # send without ever exiting. _drain_stderr counts these and triggers
+        # _restart_dead_transport() on the main loop when sustained.
+        self._transport_err_first: float = 0.0
+        self._transport_err_last: float = 0.0
+        self._transport_err_count: int = 0
+        self._transport_restart_pending: bool = False
+
         # State for async auth-dialog launch fallback chain
         self._auth_launch_commands: list = []
         self._auth_launch_index: int = 0
@@ -317,6 +351,21 @@ class PulseSSOPlugin(dbus.service.Object):
         # of a Starting emission; the timestamp lets Disconnect() distinguish
         # that quirk from a genuine user-initiated disconnect.
         self._last_starting_ts: float = 0.0
+
+        # True once openconnect has reported a live tunnel (SetIp4Config ->
+        # StateChanged(Started)) for the current process. While False, a
+        # Disconnect() landing inside the post-Starting quirk window is NM's
+        # activation-cycle quirk rather than a user action.
+        self._openconnect_connected: bool = False
+
+        # Number of NM activation-cycle quirk rescues performed for the current
+        # openconnect launch attempt. Reset on a successful connection.
+        self._quirk_rescue_count: int = 0
+
+        # Whether the user has been notified about the current gateway
+        # server-error (HTTP 5xx) outage. Reset on a successful connection so
+        # each distinct outage notifies once.
+        self._server_error_notified: bool = False
 
         # Count system-readiness failures (D-Bus, DNS, network) separately from
         # auth failures.  These are transient and should not burn the global cap.
@@ -661,6 +710,14 @@ class PulseSSOPlugin(dbus.service.Object):
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
+        # New process — tunnel not yet up. Arms the post-Starting Disconnect
+        # quirk window in Disconnect(); cleared in SetIp4Config on success.
+        self._openconnect_connected = False
+        # Fresh process — clear the dead-transport watchdog state.
+        self._transport_err_first = 0.0
+        self._transport_err_last = 0.0
+        self._transport_err_count = 0
+        self._transport_restart_pending = False
 
         # Ring buffer of the last N stderr lines, used by _on_openconnect_exit
         # to dump context when openconnect bails fast.
@@ -674,6 +731,40 @@ class PulseSSOPlugin(dbus.service.Object):
                         continue
                     tail.append(line)
                     logger.info("openconnect: %s", line)
+
+                    # Dead-transport watchdog: when the gateway is unroutable
+                    # (e.g. an interface migration that produced no NM
+                    # dispatcher 'down' event — wifi roam, dock swap with no
+                    # wlan0 down), openconnect cannot recover but also will
+                    # not exit. It floods 'Network is unreachable' on every
+                    # ESP send forever. Catch sustained floods and force a
+                    # restart on the main loop (the drain thread must not
+                    # touch GLib directly — marshal via GLib.idle_add).
+                    if ("Network is unreachable" in line
+                            and self._openconnect_connected
+                            and not self._transport_restart_pending):
+                        now = time.monotonic()
+                        if now - self._transport_err_last > 5.0:
+                            # Gap since last error — treat as a fresh burst.
+                            self._transport_err_first = now
+                            self._transport_err_count = 0
+                        self._transport_err_last = now
+                        self._transport_err_count += 1
+                        if (self._transport_err_count >= 50
+                                and now - self._transport_err_first >= 15.0):
+                            self._transport_restart_pending = True
+                            proc = self.proc
+                            proc_pid = proc.pid if proc is not None else -1
+                            logger.warning(
+                                "openconnect transport persistently dead "
+                                "(%d 'Network is unreachable' errors over "
+                                "%.1fs) — scheduling restart",
+                                self._transport_err_count,
+                                now - self._transport_err_first,
+                            )
+                            GLib.idle_add(
+                                self._restart_dead_transport, proc_pid
+                            )
             except Exception as exc:
                 logger.debug("stderr drain stopped: %s", exc)
             finally:
@@ -704,6 +795,67 @@ class PulseSSOPlugin(dbus.service.Object):
         self._child_watch_id = GLib.child_watch_add(
             self.proc.pid, self._on_openconnect_exit
         )
+
+    def _restart_dead_transport(self, pid: int) -> bool:
+        """Main-loop handler: openconnect's transport is persistently dead.
+
+        Force a teardown + re-activation so a fresh openconnect re-routes to
+        the gateway on the current interface. Scheduled by the watchdog in
+        _drain_stderr via GLib.idle_add when 'Network is unreachable' has
+        flooded for >=15s without recovery. Mirrors the Disconnect quirk-
+        rescue teardown to keep the cookie and let _reactivate_vpn_via_nm()
+        bring up a fresh tunnel.
+
+        Returns False so the GLib.idle_add callback does not repeat.
+        """
+        # Always clear the pending flag so a later real recovery can re-arm.
+        self._transport_restart_pending = False
+
+        if (self.proc is None or self.proc.pid != pid
+                or not self._openconnect_connected):
+            logger.info(
+                "Transport watchdog: state changed before restart "
+                "(proc=%s, connected=%s) — no action",
+                self.proc.pid if self.proc else None,
+                self._openconnect_connected,
+            )
+            return False
+
+        logger.warning(
+            "Transport watchdog: tearing down openconnect (PID %d) and "
+            "re-activating through NetworkManager",
+            pid,
+        )
+
+        # Same teardown shape as the Disconnect quirk-rescue: kill openconnect
+        # and null self.proc before _on_openconnect_exit fires (it bails when
+        # proc is None / pid mismatch). Keep cookie / gateway / servercert /
+        # resolve so the re-activation reuses them.
+        try:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except Exception:
+                logger.warning("openconnect did not terminate, killing")
+                self.proc.kill()
+                self.proc.wait()
+        except Exception as e:
+            logger.error("Error terminating openconnect: %s", e)
+        self.proc = None
+        self._openconnect_connected = False
+
+        self.StateChanged(ServiceState.Stopped)
+        if self._reactivation_timeout_id is not None:
+            GLib.source_remove(self._reactivation_timeout_id)
+        self._reactivation_retry_count = 0
+        self._reactivation_fallback_done = False
+        self._is_reactivation = True
+        # Brief delay so NM observes Stopped and route changes settle before
+        # we ActivateConnection.
+        self._reactivation_timeout_id = GLib.timeout_add(
+            1000, self._reactivate_vpn_via_nm
+        )
+        return False
 
     def _on_openconnect_exit(self, pid: int, status: int):
         """
@@ -1155,6 +1307,105 @@ class PulseSSOPlugin(dbus.service.Object):
             GLib.source_remove(self._auth_dialog_timeout_id)
             self._auth_dialog_timeout_id = None
 
+        # Tear down the per-session proxy NAT redirect, if any.
+        self._clear_proxy_nat()
+
+    # --- browser-auth proxy NAT redirect (per-session, ephemeral port) -----
+    #
+    # The browser reaches the local MITM proxy through an iptables NAT rule
+    # rewriting 127.0.0.1:443 -> 127.0.0.1:<proxy port>. To avoid fixed-port
+    # collisions with dev tooling, each auth session picks a fresh kernel-
+    # assigned ephemeral port (bind(0)) and installs the rule at the TOP of
+    # the nat OUTPUT chain (-I OUTPUT 1) so our per-session rule takes
+    # precedence over any pre-existing static :443 redirect (e.g. the boot-
+    # time service that may also be installed). The rule is removed when the
+    # auth session ends; outside auth, whatever the rest of the system had
+    # installed is back in effect.
+
+    def _pick_free_port(self) -> int:
+        """Return a free loopback TCP port via kernel ephemeral assignment.
+
+        bind(0) hands back a guaranteed-free port atomically — unprivileged
+        (any port >= 1024), no probe loop, no TOCTOU within the bind.
+        """
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+        finally:
+            s.close()
+
+    def _iptables_nat(self, *args: str) -> bool:
+        """Run iptables -t nat with -w (xtables lock wait). True on rc==0."""
+        cmd = ["iptables", "-w", "-t", "nat", *args]
+        try:
+            result = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=10,
+            )
+        except Exception as e:
+            logger.error("iptables exec error: %s", e)
+            return False
+        if result.returncode == 0:
+            return True
+        logger.debug(
+            "iptables %s rc=%d stderr=%s",
+            " ".join(args), result.returncode, result.stderr.strip(),
+        )
+        return False
+
+    def _install_proxy_nat(self, port: int) -> bool:
+        """Install loopback:443 -> :port REDIRECT at TOP of nat OUTPUT chain.
+
+        Inserted with -I OUTPUT 1 so it wins over any existing static :443
+        REDIRECT rule for the duration of an auth session. Tracked in
+        self._proxy_nat_port for deterministic removal by exact spec — no
+        parsing of `iptables -S` output.
+        """
+        # Defensive: if we somehow have a tracked port from a prior session
+        # that wasn't cleared, try to remove it before installing a new one.
+        if self._proxy_nat_port is not None:
+            self._clear_proxy_nat()
+
+        rule_args = [
+            "-d", "127.0.0.1/32", "-p", "tcp", "--dport", "443",
+            "-j", "REDIRECT", "--to-ports", str(port),
+        ]
+        if not self._iptables_nat("-I", "OUTPUT", "1", *rule_args):
+            logger.error(
+                "Failed to install proxy NAT redirect 127.0.0.1:443 -> :%d",
+                port,
+            )
+            return False
+        self._proxy_nat_port = port
+        logger.info(
+            "Installed proxy NAT redirect 127.0.0.1:443 -> :%d "
+            "(top of nat OUTPUT)", port,
+        )
+        return True
+
+    def _clear_proxy_nat(self) -> None:
+        """Remove the proxy NAT redirect previously installed by this service.
+
+        Uses the tracked port to delete by exact spec; if the rule isn't there
+        (already gone, never installed), iptables returns non-zero and we
+        log at debug. Always resets the tracked port to None at the end.
+        """
+        port = self._proxy_nat_port
+        if port is None:
+            return
+        rule_args = [
+            "-d", "127.0.0.1/32", "-p", "tcp", "--dport", "443",
+            "-j", "REDIRECT", "--to-ports", str(port),
+        ]
+        if self._iptables_nat("-D", "OUTPUT", *rule_args):
+            logger.info("Removed proxy NAT redirect (port %d)", port)
+        else:
+            logger.warning(
+                "Could not remove proxy NAT redirect for port %d "
+                "(may already be gone)", port,
+            )
+        self._proxy_nat_port = None
+
     def _emit_starting(self):
         """Emit StateChanged(Starting) and record monotonic timestamp.
 
@@ -1432,8 +1683,19 @@ class PulseSSOPlugin(dbus.service.Object):
                 "nm-pulse-sso-helper", "pulse-sso-auth-dialog"
             )
 
+            # Pick a free ephemeral port for the MITM proxy this session and
+            # install the loopback :443 -> :port NAT redirect at the TOP of
+            # the nat OUTPUT chain. -I OUTPUT 1 makes our per-session rule
+            # win over any pre-existing static rule for the duration of auth;
+            # the rule is removed on session end (auth-dialog exit / kill).
+            proxy_port = self._pick_free_port()
+            if not self._install_proxy_nat(proxy_port):
+                self._schedule_auth_retry("Could not install proxy NAT redirect")
+                return False
+
             logger.info(
-                "Launching auth-dialog as %s (uid=%d, display=%s)", user, uid, display
+                "Launching auth-dialog as %s (uid=%d, display=%s, proxy-port=%d)",
+                user, uid, display, proxy_port,
             )
 
             env_args = [
@@ -1476,6 +1738,7 @@ class PulseSSOPlugin(dbus.service.Object):
                     *env_args,
                     "--",
                     auth_dialog,
+                    "--proxy-port", str(proxy_port),
                 ],
                 # Some setups require the explicit .host suffix.
                 [
@@ -1490,6 +1753,7 @@ class PulseSSOPlugin(dbus.service.Object):
                     *env_args,
                     "--",
                     auth_dialog,
+                    "--proxy-port", str(proxy_port),
                 ],
                 # Fallback: launch through the system manager as the target UID.
                 [
@@ -1503,6 +1767,7 @@ class PulseSSOPlugin(dbus.service.Object):
                     *env_args,
                     "--",
                     auth_dialog,
+                    "--proxy-port", str(proxy_port),
                 ],
             ]
             self._auth_launch_index = 0
@@ -1645,6 +1910,12 @@ class PulseSSOPlugin(dbus.service.Object):
             logger.debug("Ignoring exit for unknown auth-dialog PID %d", pid)
             return
 
+        # Auth-dialog (and the proxy it spawned) has exited — the per-session
+        # NAT redirect is no longer needed. openconnect dials the real gateway
+        # IP via --resolve, bypassing the loopback hosts override, so removing
+        # the redirect here does not affect tunnel establishment.
+        self._clear_proxy_nat()
+
         # Check if disconnect was requested while we were waiting
         if not self._reconnection_pending:
             logger.info(
@@ -1686,6 +1957,25 @@ class PulseSSOPlugin(dbus.service.Object):
                 exit_code,
                 stderr_text,
             )
+
+            # Exit code 3: the proxy reported the VPN gateway returned HTTP 5xx
+            # — a server-side outage, not an auth failure and not a launch-
+            # strategy problem. Don't cycle launch strategies or count it
+            # toward the auth-failure cap; notify the user once and retry
+            # after a longer backoff. When the gateway recovers, auth succeeds.
+            if exit_code == 3:
+                logger.warning(
+                    "auth-dialog: VPN gateway returned server errors (HTTP "
+                    "5xx) — backing off, will retry"
+                )
+                if not self._server_error_notified:
+                    self._server_error_notified = True
+                    self._send_user_notification(
+                        "VPN Gateway Error",
+                        "VPN gateway is returning server errors — retrying",
+                    )
+                self._schedule_direct_auth(30000)
+                return
 
             # Track transient vs real auth failures.
             # "Transport endpoint" and "CEF initialization failed" are system
@@ -1736,6 +2026,18 @@ class PulseSSOPlugin(dbus.service.Object):
         if not cookie:
             logger.error("No cookie in auth-dialog output: %s", stdout.decode())
             self._schedule_auth_retry("No cookie in auth-dialog output")
+            return
+
+        # Defence in depth: the proxy already rejects degenerate DSIDs, but
+        # never hand openconnect an implausibly short cookie (e.g. the 1-char
+        # placeholder DSID Pulse sets mid-SAML-flow when the gateway is flaky).
+        # A real session DSID is a long hex token.
+        if len(cookie.strip()) < self.MIN_DSID_LEN:
+            logger.error(
+                "auth-dialog returned an implausible cookie (len=%d) — "
+                "treating as a failed auth", len(cookie.strip()),
+            )
+            self._schedule_auth_retry("auth-dialog returned a degenerate cookie")
             return
 
         # Check disconnect again (could have been requested during output parsing)
@@ -2183,6 +2485,94 @@ class PulseSSOPlugin(dbus.service.Object):
             return
 
         if self.proc is not None:
+            # NM's activation-cycle quirk: it reflexively fires Disconnect()
+            # within a few hundred ms of the StateChanged(Starting) we emit
+            # when launching openconnect for a (re)activation. If openconnect
+            # has not yet reported a live tunnel and we are inside that window,
+            # this is the quirk — not a user action. Rescue it: tear down the
+            # just-launched openconnect (it is <1s old, no tunnel/routes yet,
+            # so no zombie-VPN risk), keep the cookie, and re-activate through
+            # NM. Bounded by MAX_QUIRK_RESCUES to avoid an infinite loop.
+            elapsed = (
+                time.monotonic() - self._last_starting_ts
+                if self._last_starting_ts else 999.0
+            )
+            in_quirk_window = (
+                not self._openconnect_connected
+                and elapsed < self.USER_CANCEL_THRESHOLD
+            )
+
+            if in_quirk_window and self._quirk_rescue_count < self.MAX_QUIRK_RESCUES:
+                self._quirk_rescue_count += 1
+                logger.info(
+                    "Disconnect %.2fs after Starting (openconnect launching, "
+                    "not yet connected) — NM activation-cycle quirk, rescuing "
+                    "(%d/%d)",
+                    elapsed, self._quirk_rescue_count, self.MAX_QUIRK_RESCUES,
+                )
+                # Tear down the just-launched openconnect. Nulling self.proc
+                # before the GLib child-watch fires makes _on_openconnect_exit
+                # no-op (it bails when proc is None / pid mismatch).
+                logger.info("Terminating openconnect process %d", self.proc.pid)
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=5)
+                except Exception:
+                    logger.warning("Process did not terminate, killing")
+                    self.proc.kill()
+                    self.proc.wait()
+                self.proc = None
+
+                # Keep self.cookie / gateway / servercert / resolve so the
+                # re-activation reuses the cookie instead of re-prompting auth.
+                # Do NOT remove /run/vpn-auto-reconnect and do NOT quit.
+                self.StateChanged(ServiceState.Stopped)
+                if self._reactivation_timeout_id is not None:
+                    GLib.source_remove(self._reactivation_timeout_id)
+                self._reactivation_retry_count = 0
+                self._reactivation_fallback_done = False
+                self._is_reactivation = True
+                if self._needs_post_disruption_delay:
+                    delay = 8000
+                    self._needs_post_disruption_delay = False
+                    logger.info(
+                        "Using extended %dms delay for server session cleanup",
+                        delay,
+                    )
+                else:
+                    delay = 500
+                self._reactivation_timeout_id = GLib.timeout_add(
+                    delay, self._reactivate_vpn_via_nm
+                )
+                return
+
+            if in_quirk_window:
+                # Quirk-rescue budget exhausted — NM's state never settled.
+                # Cooperate with teardown but leave /run/vpn-auto-reconnect in
+                # place so the external vpn-auto-reconnect service / the user
+                # can still recover.
+                logger.warning(
+                    "Disconnect %.2fs after Starting but quirk-rescue budget "
+                    "exhausted (%d) — giving up this cycle, leaving "
+                    "auto-reconnect flag for external recovery",
+                    elapsed, self._quirk_rescue_count,
+                )
+                logger.info("Terminating openconnect process %d", self.proc.pid)
+                self.proc.terminate()
+                try:
+                    self.proc.wait(timeout=5)
+                except Exception:
+                    self.proc.kill()
+                    self.proc.wait()
+                self.proc = None
+                self._clear_cached_secrets()
+                self.StateChanged(ServiceState.Stopped)
+                logger.info(
+                    "Stopping service event loop (quirk-rescue budget exhausted)"
+                )
+                self.loop.quit()
+                return
+
             # User/NM initiated disconnect while VPN is running
             logger.info("User-initiated disconnect — removing auto-reconnect flag")
             self._disconnect_requested = True
@@ -2305,6 +2695,18 @@ class PulseSSOPlugin(dbus.service.Object):
             self._auth_failure_count = 0
         self._cookie_is_fresh = False
         self._needs_post_disruption_delay = False
+
+        # Tunnel is live — close the Disconnect quirk window, reset the
+        # per-launch quirk-rescue budget, re-arm server-error notification,
+        # and clear the dead-transport watchdog (a real reconnect counts as
+        # recovery; any prior burst is no longer relevant).
+        self._openconnect_connected = True
+        self._quirk_rescue_count = 0
+        self._server_error_notified = False
+        self._transport_err_first = 0.0
+        self._transport_err_last = 0.0
+        self._transport_err_count = 0
+        self._transport_restart_pending = False
 
         if self._total_auth_launch_failures > 0:
             logger.info(

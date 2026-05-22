@@ -192,6 +192,15 @@ def main():
             print("Authentication timed out", file=sys.stderr)
             sys.exit(1)
 
+        if proxy_proc.returncode == 3:
+            # Distinct from an auth failure: the VPN gateway returned HTTP 5xx.
+            # The VPN service treats this exit code as a transient server-side
+            # outage — backs off and retries instead of burning the auth cap.
+            print("VPN gateway returned server errors (HTTP 5xx) — "
+                  "server-side problem, not an authentication failure",
+                  file=sys.stderr)
+            sys.exit(3)
+
         if proxy_proc.returncode != 0:
             print("Authentication failed (proxy exited with error)", file=sys.stderr)
             sys.exit(1)

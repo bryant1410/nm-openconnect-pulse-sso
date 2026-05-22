@@ -10,6 +10,7 @@
   util-linux,
   systemd,
   iproute2,
+  iptables,
   xdg-utils,
   # Local TLS cert+key for the MITM proxy (generated in module.nix from cfg.gateway)
   cert,
@@ -89,7 +90,7 @@ stdenv.mkDerivation rec {
       --add-flags "--proxy-port ${toString proxyPort}"
 
     wrapProgram $out/libexec/nm-pulse-sso-service \
-      --prefix PATH : ${lib.makeBinPath [ openconnect util-linux systemd ]} \
+      --prefix PATH : ${lib.makeBinPath [ openconnect util-linux systemd iptables ]} \
       --set PYTHONPATH "${pythonEnvService}/${pythonEnvService.sitePackages}" \
       --add-flags "--helper-script $out/libexec/nm-pulse-sso-helper"
 

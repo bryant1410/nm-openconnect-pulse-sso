@@ -172,8 +172,18 @@ if [ -f "$GRACE_FILE" ]; then
     NOW=$(@coreutils@/bin/date +%s)
     CONNECT_AGO=$((NOW - LAST_CONNECT))
     if [ "$CONNECT_AGO" -lt 10 ]; then
-        log_msg "VPN connected ${CONNECT_AGO}s ago, skipping kill (grace period)"
-        exit 0
+        if [ "$ACTION" = "down" ]; then
+            # A physical interface going down while openconnect is running
+            # is never the spurious activation-churn the grace period is
+            # meant to absorb — it is a real disruption. The wlan0-down
+            # event in a wifi -> dock-ethernet migration MUST trigger
+            # reconnect even within 10s of connect; otherwise the tunnel
+            # stays pinned to the dead path until the user intervenes.
+            log_msg "VPN connected ${CONNECT_AGO}s ago, but physical interface $IFACE went DOWN — real disruption, not applying grace skip"
+        else
+            log_msg "VPN connected ${CONNECT_AGO}s ago, skipping kill (grace period)"
+            exit 0
+        fi
     fi
 fi
 

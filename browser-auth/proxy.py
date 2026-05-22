@@ -124,6 +124,24 @@ def looks_like_clear_cookie(value: str) -> bool:
     return v in ("", "deleted", "null", "0")
 
 
+# A real Pulse session DSID is a long hex token (~32 chars). Anything much
+# shorter is the transient placeholder Pulse sets during the early SAML
+# redirect (observed: "DSID=1") — never a usable session cookie.
+_MIN_REAL_DSID_LEN = 16
+
+
+def looks_like_real_dsid(value: str, status: str) -> bool:
+    """A committable DSID: not a clear/placeholder cookie, long enough to be a
+    real session token, and not captured from a server-error (5xx) response."""
+    if looks_like_clear_cookie(value):
+        return False
+    if len(value.strip('"')) < _MIN_REAL_DSID_LEN:
+        return False
+    if status and status.startswith("5"):
+        return False
+    return True
+
+
 # --- shared connection state ------------------------------------------------
 
 class CaptureState:
@@ -133,6 +151,8 @@ class CaptureState:
         self._lock = threading.Lock()
         self._candidates: list[dict] = []
         self._last_seen_monotonic: float = 0.0
+        self._saw_server_error: bool = False
+        self._server_error_statuses: set = set()
 
     def record(self, dsid: str, raw_setcookie: str, request_path: str,
                response_status: str, location: str, conn_id: int):
@@ -155,9 +175,28 @@ class CaptureState:
     def latest_committable(self) -> Optional[dict]:
         with self._lock:
             for c in reversed(self._candidates):
-                if not looks_like_clear_cookie(c["dsid"]):
+                if looks_like_real_dsid(c["dsid"], c["response_status"]):
                     return c
             return None
+
+    def any_dsid_seen(self) -> bool:
+        """True if any DSID Set-Cookie was observed, committable or not."""
+        with self._lock:
+            return bool(self._candidates)
+
+    def note_server_error(self, status: str, conn_id: int):
+        """Record that the upstream gateway returned an HTTP 5xx response."""
+        with self._lock:
+            first = not self._saw_server_error
+            self._saw_server_error = True
+            self._server_error_statuses.add(status)
+        if first:
+            log(f"  [c{conn_id}] upstream gateway returned server error "
+                f"(HTTP {status})")
+
+    def saw_server_error(self) -> bool:
+        with self._lock:
+            return self._saw_server_error
 
     def all_candidates(self) -> list[dict]:
         with self._lock:
@@ -198,6 +237,11 @@ def _scan_response_headers(buf: bytes, conn_id: int, state: CaptureState,
     last_status = None
     for m in _RESP_LINE_RE.finditer(buf):
         last_status = m.group(1).decode("ascii", errors="replace")
+
+    # Flag gateway server errors (HTTP 5xx). note_server_error() de-dups, so
+    # re-seeing the same status as the buffer streams in is harmless.
+    if last_status and last_status.startswith("5"):
+        state.note_server_error(last_status, conn_id)
 
     last_location = ""
     for m in _LOCATION_RE.finditer(buf):
@@ -388,9 +432,9 @@ def main():
     try:
         sock.bind(("127.0.0.1", args.port))
     except OSError as e:
-        log(f"Could not bind 127.0.0.1:{args.port}: {e}. Another process is "
-            f"holding this port — set services.nm-pulse-sso.browserAuthProxyPort "
-            f"to a free port.")
+        log(f"Could not bind 127.0.0.1:{args.port}: {e}. Another process "
+            f"grabbed this port in the gap since it was picked — the "
+            f"nm-pulse-sso service will pick a fresh port and retry.")
         sys.exit(1)
     sock.listen(20)
     sock.settimeout(1.0)
@@ -424,13 +468,15 @@ def main():
             log(f"Timed out after {args.timeout}s waiting for DSID.")
             break
 
-        # If we've seen at least one DSID and it's been quiet for --quiesce,
-        # commit.
-        if state.latest_committable() is not None:
+        # Commit once at least one DSID candidate has been seen and things
+        # have been quiet for --quiesce. We quiesce on ANY candidate (not only
+        # committable ones) so a flow that produced only a degenerate / early
+        # placeholder DSID fails fast instead of waiting out the full timeout.
+        if state.any_dsid_seen():
             quiet_for = state.seconds_since_last_dsid()
             if quiet_for >= args.quiesce:
-                log(f"DSID quiesced for {quiet_for:.1f}s ≥ {args.quiesce}s — "
-                    f"committing latest.")
+                log(f"DSID activity quiesced for {quiet_for:.1f}s ≥ "
+                    f"{args.quiesce}s — committing.")
                 break
 
         try:
@@ -456,21 +502,29 @@ def main():
 
     chosen = state.latest_committable()
     all_seen = state.all_candidates()
+    saw_server_error = state.saw_server_error()
 
     log(f"Total DSID candidates seen: {len(all_seen)}")
     for i, c in enumerate(all_seen, 1):
-        bogus = " [BOGUS]" if looks_like_clear_cookie(c["dsid"]) else ""
+        committable = looks_like_real_dsid(c["dsid"], c["response_status"])
+        tag = "" if committable else " [REJECTED]"
         marker = " <-- SELECTED" if chosen is not None and c is chosen else ""
-        log(f"  candidate #{i}{bogus}{marker}: status={c['response_status']} "
+        log(f"  candidate #{i}{tag}{marker}: status={c['response_status']} "
             f"len={len(c['dsid'])} path={c['request_path']!r} "
             f"loc={c['location']!r}")
 
     if chosen is None:
-        log("No usable DSID captured.")
         # Still write the candidates list so the auth-dialog / user can see
         # what we did see (e.g. an HSTS-blocked browser would produce zero).
         with open(args.output, "w") as f:
-            json.dump({"gwcert": gwcert, "candidates": all_seen}, f)
+            json.dump({"gwcert": gwcert, "candidates": all_seen,
+                       "saw_server_error": saw_server_error}, f)
+        if saw_server_error:
+            # Distinct exit code: the gateway is having a server-side outage,
+            # not an authentication failure. The caller backs off and retries.
+            log("No usable DSID — VPN gateway returned server errors (HTTP 5xx).")
+            sys.exit(3)
+        log("No usable DSID captured.")
         sys.exit(1)
 
     # The IP we resolved via DoH is essential for openconnect: /etc/hosts
