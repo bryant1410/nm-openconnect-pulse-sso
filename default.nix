@@ -13,6 +13,7 @@
   util-linux,
   systemd,
   iproute2,
+  iptables,
   cef-pulse-auth,
 }:
 
@@ -78,7 +79,7 @@ stdenv.mkDerivation rec {
   postFixup = ''
     # Wrap the VPN service (runs as root, needs openconnect + tools for direct auth)
     wrapProgram $out/libexec/nm-pulse-sso-service \
-      --prefix PATH : ${lib.makeBinPath [ openconnect util-linux systemd ]} \
+      --prefix PATH : ${lib.makeBinPath [ openconnect util-linux systemd iptables ]} \
       --set PYTHONPATH "${pythonEnvService}/${pythonEnvService.sitePackages}" \
       --add-flags "--helper-script $out/libexec/nm-pulse-sso-helper"
 
