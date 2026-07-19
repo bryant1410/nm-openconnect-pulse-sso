@@ -1,0 +1,2 @@
+# Local, per-machine installer config — holds your real gateway URL. Never commit.
+config.env
