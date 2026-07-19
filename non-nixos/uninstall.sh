@@ -64,9 +64,18 @@ rm -f "$VPNC_PC/00-auto-reconnect-flag" "$VPNC_PC/add-default-route" \
       "$VPNC_PC/narrow-docker-route" "$VPNC_PC/flush-dns" \
       "$VPNC_RC/fix-default-route" "$VPNC_RC/narrow-docker-route" "$VPNC_RC/flush-dns"
 rm -f /run/vpn-auto-reconnect /run/vpn-last-connect /run/vpn-reconnect-last-kill
-# Restore default rp_filter behavior now (file already removed).
-sysctl -w net.ipv4.conf.all.rp_filter=1 >/dev/null 2>&1 || true
-sysctl -w net.ipv4.conf.default.rp_filter=1 >/dev/null 2>&1 || true
+# Restore rp_filter to its captured pre-install value. (A previous version
+# forced =1, which is STRICTER than Ubuntu's 2/loose default and dropped
+# asymmetrically-routed VPN return traffic until the next reboot.)
+if [ -f "$CONFIG_DIR/rp_filter.orig" ]; then
+  RPF_ALL=""; RPF_DEFAULT=""
+  . "$CONFIG_DIR/rp_filter.orig" 2>/dev/null || true
+  [ -n "${RPF_ALL:-}" ]     && sysctl -w net.ipv4.conf.all.rp_filter="$RPF_ALL"         >/dev/null 2>&1 || true
+  [ -n "${RPF_DEFAULT:-}" ] && sysctl -w net.ipv4.conf.default.rp_filter="$RPF_DEFAULT" >/dev/null 2>&1 || true
+fi
+# Reassert the OS-shipped sysctl config as the authoritative fallback
+# (on Ubuntu this restores rp_filter=2 from /usr/lib/sysctl.d/).
+sysctl --system >/dev/null 2>&1 || true
 ok "recovery hooks removed"
 
 msg "Reverting /etc/hosts override"

@@ -128,7 +128,8 @@ ok "all dependencies present"
 # Local CA + server cert for the MITM proxy (mirrors module.nix:26-48)
 # --------------------------------------------------------------------------
 msg "Local PKI ($PKI)"
-install -d -m700 "$PKI"
+install -d -m755 "$CONFIG_DIR"
+install -d -m755 "$PKI"
 if [ "${FORCE_PKI:-0}" = 1 ] || [ ! -s "$PKI/ca.crt" ] || [ ! -s "$PKI/server.crt" ]; then
   openssl genrsa -out "$PKI/ca.key" 2048 2>/dev/null
   openssl req -new -x509 -days 3650 -key "$PKI/ca.key" -out "$PKI/ca.crt" \
@@ -139,11 +140,21 @@ if [ "${FORCE_PKI:-0}" = 1 ] || [ ! -s "$PKI/ca.crt" ] || [ ! -s "$PKI/server.cr
   openssl x509 -req -days 3650 -in "$PKI/server.csr" \
     -CA "$PKI/ca.crt" -CAkey "$PKI/ca.key" -CAcreateserial -out "$PKI/server.crt" \
     -extfile <(printf 'subjectAltName=DNS:%s\n' "$GATEWAY_HOST") 2>/dev/null
-  chmod 600 "$PKI"/*.key
+  rm -f "$PKI/server.csr"
   ok "generated CA + server cert (SAN=$GATEWAY_HOST)"
 else
   ok "keeping existing CA/cert (FORCE_PKI=1 to regenerate)"
 fi
+# The MITM proxy runs as the DESKTOP USER (auth-dialog launches it via
+# `systemd-run --user`), so it MUST be able to read the server cert+key.
+# Only ca.key (the CA signing anchor) stays root-only. Exposing server.key
+# permits only loopback MITM of this one gateway host — the same trade-off
+# upstream accepts by shipping the key in the world-readable nix store.
+# Re-applied every run so an older root-only (0700/0600) install is corrected.
+chmod 755 "$CONFIG_DIR" "$PKI"
+chmod 600 "$PKI/ca.key"                                       2>/dev/null || true
+chmod 644 "$PKI/ca.crt" "$PKI/server.crt" "$PKI/server.key"  2>/dev/null || true
+ok "cert/key readable by the proxy user; ca.key stays root-only"
 
 # --------------------------------------------------------------------------
 # Runtime code + wrappers (mirrors browser-auth/default.nix install+postFixup)
@@ -290,10 +301,21 @@ ok "redirect active"
 # Substitute Nix placeholders (@pkg@/bin/cmd -> cmd on PATH, @vpnName@ -> name),
 # and inject an explicit PATH after the shebang so bare commands resolve.
 subst_script() {  # src dst mode
+  # 1) awk: inject PATH after the shebang, strip Nix @pkg@/bin/ prefixes, sub @vpnName@.
+  # 2) sed: scope openconnect matching to OUR tunnel only (identified by our
+  #    --script helper path in the process cmdline) so the recovery layer never
+  #    kills a coexisting openconnect VPN — e.g. an official Pulse/AnyConnect
+  #    client running at the same time. The bare `-x openconnect` upstream form
+  #    would match ANY openconnect process on the machine.
   awk -v vpnname="$VPN_NAME" -v syspath="$SYS_PATH" '
     NR==1 { print; print "export PATH=" syspath; next }
     { gsub(/@[A-Za-z0-9_-]+@\/bin\//, ""); gsub(/@vpnName@/, vpnname); print }
-  ' "$1" > "$2"
+  ' "$1" \
+  | sed -E \
+      -e 's/pgrep -x openconnect/pgrep -f "openconnect.*nm-pulse-sso-helper"/g' \
+      -e 's/pkill -9 -x openconnect/pkill -9 -f "openconnect.*nm-pulse-sso-helper"/g' \
+      -e 's/pkill -x openconnect/pkill -f "openconnect.*nm-pulse-sso-helper"/g' \
+      > "$2"
   chmod "$3" "$2"
 }
 
@@ -350,7 +372,16 @@ EOF
   systemctl daemon-reload
   ok "installed vpn-auto-reconnect.service + resume sleep hook"
 
-  # rp_filter=loose (NixOS checkReversePath="loose" equivalent)
+  # rp_filter=loose (NixOS checkReversePath="loose" equivalent).
+  # Capture the pre-change values FIRST (only on the very first install) so
+  # uninstall can restore them EXACTLY rather than guessing a default — Ubuntu
+  # ships 2/loose, and forcing a stricter value breaks VPN return traffic.
+  if [ ! -f "$CONFIG_DIR/rp_filter.orig" ]; then
+    {
+      echo "RPF_ALL=$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null)"
+      echo "RPF_DEFAULT=$(sysctl -n net.ipv4.conf.default.rp_filter 2>/dev/null)"
+    } > "$CONFIG_DIR/rp_filter.orig"
+  fi
   cat > "$SYSCTL_FILE" <<EOF
 # Loose reverse-path filtering: required for reliable VPN reconnection
 net.ipv4.conf.all.rp_filter=2

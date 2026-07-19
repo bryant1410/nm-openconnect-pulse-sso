@@ -129,10 +129,13 @@ ip addr show tun0
 
 ## Caveats
 
-- A **local MITM CA** is trusted system-wide and in your browsers. Its key
-  lives at `/etc/nm-pulse-sso/pki/ca.key` (root, `0600`). It can only mint certs
-  for your one gateway host on loopback during auth. `FORCE_PKI=1 sudo ./install.sh`
-  rotates it (re-run `pulse-browser-auth-trust install` afterward).
+- A **local MITM CA** is trusted system-wide and in your browsers. The CA
+  signing key (`/etc/nm-pulse-sso/pki/ca.key`) stays root-only (`0600`); the
+  gateway **server** key (`server.key`) is world-readable (`0644`) because the
+  auth proxy runs as your desktop user. That only permits loopback MITM of the
+  one gateway host — the same trade-off upstream makes by shipping the key in
+  the world-readable Nix store. `FORCE_PKI=1 sudo ./install.sh` rotates them
+  (re-run `pulse-browser-auth-trust install` afterward).
 - `/etc/hosts` **permanently** points the gateway host at `127.0.0.1`, so you
   can't reach the gateway directly outside auth. The tunnel bypasses this via
   openconnect `--resolve` (set automatically from the proxy's DoH lookup).
