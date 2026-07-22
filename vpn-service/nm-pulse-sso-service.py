@@ -1287,7 +1287,7 @@ class PulseSSOPlugin(dbus.service.Object):
         for pattern in ("pulse-sso-auth-dialog", "pulse-browser-auth"):
             try:
                 result = subprocess.run(
-                    ["pkill", "-KILL", "-echo", "-f", pattern],
+                    ["pkill", "-KILL", "--echo", "-f", pattern],
                     capture_output=True, text=True, timeout=2,
                 )
                 if result.returncode == 0:
