@@ -15,7 +15,7 @@ On any Ubuntu/Debian machine, from a clone of your fork:
 
 ```bash
 cd nm-openconnect-pulse-sso/non-nixos
-cp config.env.example config.env     # then set GATEWAY (full URL incl. realm path)
+cp config.env.example config.env     # then set GATEWAY (or CONNECTIONS for several)
 $EDITOR config.env
 sudo ./install.sh                    # idempotent; prints any missing apt deps
 nmcli connection up "Pulse VPN"      # your default browser opens for SSO
@@ -45,7 +45,7 @@ git clone <your-fork-url>
 cd nm-openconnect-pulse-sso/non-nixos
 
 cp config.env.example config.env     # config.env is gitignored
-$EDITOR config.env                   # set GATEWAY (required)
+$EDITOR config.env                   # set GATEWAY (or CONNECTIONS for several)
 
 sudo ./install.sh
 ```
@@ -67,14 +67,39 @@ nmcli connection up "Pulse VPN"      # or pick it from the GNOME/KDE network men
 Your default browser opens the gateway for SSO. When sign-in completes, the tab
 can be closed and the tunnel comes up.
 
-## Choosing the gateway realm (e.g. `emp` vs `emp-split`)
+## One connection, or several (e.g. `emp` and `emp-split`)
 
-The realm is just the **path** of the gateway URL — nothing is hardcoded. Set
-`GATEWAY` in `config.env` to the URL your VPN admin gives you, including the
-realm path, e.g. `.../emp` (full tunnel) or `.../emp-split` (split tunnel).
-Changing it only affects the stored connection; the hostname (used for
-`/etc/hosts` and the local cert) is unchanged. Re-run `sudo ./install.sh` after
-editing.
+The realm is just the **path** of the gateway URL — nothing is hardcoded. For a
+single connection, set `GATEWAY` to the URL your VPN admin gives you, including
+the realm path, e.g. `.../emp` (full tunnel) or `.../emp-split` (split tunnel).
+
+To install **several named connections at once**, set `CONNECTIONS` instead —
+one `Name = URL` per line (or `;`-separated). It takes precedence over
+`GATEWAY`/`VPN_NAME`:
+
+```bash
+CONNECTIONS="
+  Pulse emp        = https://pcs.flxvpn.net/emp
+  Pulse emp-split  = https://pcs.flxvpn.net/emp-split
+"
+```
+
+Each entry becomes its own NetworkManager connection — its own entry in the
+network menu and its own `nmcli connection up "<name>"` — with a stable UUID
+preserved across re-runs. Gateways may share a host (as above) or point at
+different hosts; the installer adds every host to `/etc/hosts` and to the local
+cert's SANs automatically. Re-run `sudo ./install.sh` after editing, then
+connect to whichever you need:
+
+```bash
+nmcli connection up "Pulse emp-split"
+```
+
+> **Connect to one at a time.** Auto-reconnect tracks whichever connection was
+> active (a per-connection flag keyed by UUID) and brings *that* one back after
+> suspend/roam. Running two of these tunnels *simultaneously* works, but the
+> network-change cooldown state is shared, so recovery is best-effort — not
+> recommended.
 
 ## What gets installed
 
@@ -148,6 +173,6 @@ ip addr show tun0
 sudo ./uninstall.sh
 ```
 
-Reverses everything (services, hosts entry, iptables rule, CA trust, NM
-connection, code). It leaves your browser profile
+Reverses everything (services, hosts entries, iptables rule, CA trust, all NM
+connections that use our service-type, code). It leaves your browser profile
 (`~/.cache/pulse-browser-auth`) alone.

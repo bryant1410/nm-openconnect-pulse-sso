@@ -5,35 +5,64 @@
 # Triggered by: vpn-reconnect (post-resume), nm-dispatcher (network change)
 # Uses nmcli (same as a user would) — avoids all NM plugin state machine conflicts.
 #
-# VPN_NAME is substituted at build time via @vpnName@
+# Two flag schemes are supported (per-connection wins when present):
+#   - Per-connection (multi-connection installs): /run/vpn-auto-reconnect.d/<uuid>
+#     written by the D-Bus service on connect, removed on user disconnect.
+#     Reconnect each flagged connection by UUID — brings back exactly what was
+#     active before a suspend/roam.
+#   - Legacy single flag (older/NixOS single-connection installs):
+#     /run/vpn-auto-reconnect — reconnect the one connection named @vpnName@.
 
 VPN_NAME="@vpnName@"
-FLAG="/run/vpn-auto-reconnect"
+FLAG_DIR="/run/vpn-auto-reconnect.d"
+LEGACY_FLAG="/run/vpn-auto-reconnect"
 LOCK="/run/vpn-auto-reconnect.lock"
 
-# Only reconnect if flag file exists (VPN was connected and not user-disconnected)
-if [ ! -f "$FLAG" ]; then
-    echo "Auto-reconnect not enabled (no flag file), skipping"
-    exit 0
-fi
+# Emit reconnect targets, one per line: "<kind> <ref>" (kind is uuid|id).
+emit_targets() {
+    if [ -d "$FLAG_DIR" ] && [ -n "$(ls -A "$FLAG_DIR" 2>/dev/null)" ]; then
+        for f in "$FLAG_DIR"/*; do
+            [ -e "$f" ] || continue
+            echo "uuid ${f##*/}"
+        done
+    elif [ -f "$LEGACY_FLAG" ]; then
+        echo "id $VPN_NAME"
+    fi
+}
 
-# Check if VPN is already connected or activating (auth-dialog may already be open)
-if @networkmanager@/bin/nmcli -t -f TYPE,STATE connection show --active 2>/dev/null | grep -q "^vpn:activated$"; then
-    echo "VPN already connected"
-    exit 0
-fi
-if @networkmanager@/bin/nmcli -t -f TYPE,STATE connection show --active 2>/dev/null | grep -q "^vpn:activating$"; then
-    echo "VPN already activating (auth dialog running), skipping duplicate attempt"
+# Is the target's flag still present? (user may disconnect during our wait)
+flag_present() {  # kind ref
+    case "$1" in
+        uuid) [ -e "$FLAG_DIR/$2" ] ;;
+        *)    [ -f "$LEGACY_FLAG" ] ;;
+    esac
+}
+
+# VPN state for a target: prints activated|activating|"".
+conn_state() {  # kind ref
+    case "$1" in
+        uuid) @networkmanager@/bin/nmcli -t -f UUID,TYPE,STATE connection show --active 2>/dev/null \
+                | @gawk@/bin/awk -F: -v k="$2" '$1==k && $2=="vpn" {print $3}' ;;
+        *)    @networkmanager@/bin/nmcli -t -f NAME,TYPE,STATE connection show --active 2>/dev/null \
+                | @gawk@/bin/awk -F: -v k="$2" '$1==k && $2=="vpn" {print $3}' ;;
+    esac
+}
+
+TARGETS_FILE=$(mktemp)
+emit_targets > "$TARGETS_FILE"
+if [ ! -s "$TARGETS_FILE" ]; then
+    echo "Auto-reconnect not enabled (no flag), skipping"
+    rm -f "$TARGETS_FILE"
     exit 0
 fi
 
 # Lock to prevent concurrent reconnect attempts
 exec 200>"$LOCK"
-@util-linux@/bin/flock -n 200 || { echo "Another reconnect attempt in progress"; exit 0; }
+@util-linux@/bin/flock -n 200 || { echo "Another reconnect attempt in progress"; rm -f "$TARGETS_FILE"; exit 0; }
 
-# Kill any lingering openconnect processes (e.g., stale after resume)
-# Only wait if openconnect is actually running — avoids 2s delay in the common
-# interface-change case where the service already killed it.
+# Kill any lingering openconnect processes (e.g., stale after resume).
+# (install.sh rewrites the bare `-x openconnect` matches below to our --script
+# helper path, so we never touch a coexisting official Pulse/AnyConnect tunnel.)
 if @procps@/bin/pgrep -x openconnect >/dev/null 2>&1; then
     @procps@/bin/pkill -x openconnect 2>/dev/null || true
     sleep 2
@@ -56,7 +85,6 @@ for i in $(@coreutils@/bin/seq 1 10); do
 done
 
 # Only pause to let NM settle if we had to wait for connectivity.
-# When NM was already connected (common interface-change case), this is pure waste.
 if [ "$nm_was_ready" != "yes" ]; then
     sleep 3
 fi
@@ -95,58 +123,65 @@ fi
 @systemd@/bin/resolvectl flush-caches 2>/dev/null || true
 @systemd@/bin/resolvectl reset-server-features 2>/dev/null || true
 
-# Attempt reconnect with increasing backoff
-for attempt in 1 2 3 4 5; do
-    echo "VPN reconnect attempt $attempt..."
+notify_all() {  # icon title body
+    for uid in $(@systemd@/bin/loginctl list-users --no-legend | @gawk@/bin/awk '{print $1}'); do
+        RUNTIME_DIR="/run/user/$uid"
+        if [ -S "$RUNTIME_DIR/bus" ]; then
+            @sudo@/bin/sudo -u "#$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNTIME_DIR/bus" \
+                @libnotify@/bin/notify-send -i "$1" "$2" "$3" 2>/dev/null || true
+        fi
+    done
+}
 
-    # Check flag still exists (user may have disconnected during our wait)
-    if [ ! -f "$FLAG" ]; then
-        echo "Flag file removed during reconnect — user disconnected"
-        exit 0
+# Reconnect each target that isn't already up, with per-attempt backoff.
+# Typical usage keeps exactly one connection active, so this loop usually runs
+# once; it also handles the multi-tunnel case without a hardcoded name.
+# Read from a file (not a pipe) so the loop runs in this shell and connection
+# names containing spaces survive intact.
+overall_rc=0
+while IFS=' ' read -r kind ref; do
+    [ -n "$kind" ] || continue
+
+    if [ "$kind" = "uuid" ]; then
+        name=$(@networkmanager@/bin/nmcli -t -f UUID,NAME connection show 2>/dev/null \
+                 | @gawk@/bin/awk -F: -v u="$ref" '$1==u {print $2; exit}')
+        [ -n "$name" ] || name="$ref"
+    else
+        name="$ref"
     fi
 
-    # Check if VPN was already reconnected (e.g., by NM re-activation path)
-    if @networkmanager@/bin/nmcli -t -f TYPE,STATE connection show --active 2>/dev/null | grep -q "^vpn:activated$"; then
-        echo "VPN already reconnected (by another path)"
-        for uid in $(@systemd@/bin/loginctl list-users --no-legend | @gawk@/bin/awk '{print $1}'); do
-            RUNTIME_DIR="/run/user/$uid"
-            if [ -S "$RUNTIME_DIR/bus" ]; then
-                @sudo@/bin/sudo -u "#$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNTIME_DIR/bus" \
-                    @libnotify@/bin/notify-send -i network-vpn "VPN Reconnected" \
-                    "VPN auto-reconnected successfully" 2>/dev/null || true
-            fi
-        done
-        exit 0
+    result="failed"
+    for attempt in 1 2 3 4 5; do
+        flag_present "$kind" "$ref" || { echo "[$name] flag removed — user disconnected, skipping"; result="skip"; break; }
+
+        state=$(conn_state "$kind" "$ref")
+        if [ "$state" = "activated" ]; then
+            echo "[$name] already connected"
+            result="ok"; break
+        fi
+        if [ "$state" = "activating" ]; then
+            echo "[$name] already activating (auth dialog running), skipping duplicate attempt"
+            result="ok"; break
+        fi
+
+        echo "[$name] reconnect attempt $attempt..."
+        if @networkmanager@/bin/nmcli connection up "$kind" "$ref" 2>&1; then
+            echo "[$name] reconnected successfully"
+            notify_all network-vpn "VPN Reconnected" "$name auto-reconnected successfully"
+            result="ok"; break
+        fi
+
+        DELAY=$((attempt * 3))
+        echo "[$name] attempt $attempt failed, retrying in ${DELAY}s..."
+        sleep "$DELAY"
+    done
+
+    if [ "$result" = "failed" ]; then
+        echo "[$name] reconnect failed after 5 attempts"
+        notify_all dialog-warning "VPN Reconnect Failed" "$name: auto-reconnect failed after 5 attempts. Please reconnect manually."
+        overall_rc=1
     fi
+done < "$TARGETS_FILE"
+rm -f "$TARGETS_FILE"
 
-    if @networkmanager@/bin/nmcli connection up "$VPN_NAME" 2>&1; then
-        echo "VPN reconnected successfully"
-
-        # Notify user
-        for uid in $(@systemd@/bin/loginctl list-users --no-legend | @gawk@/bin/awk '{print $1}'); do
-            RUNTIME_DIR="/run/user/$uid"
-            if [ -S "$RUNTIME_DIR/bus" ]; then
-                @sudo@/bin/sudo -u "#$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNTIME_DIR/bus" \
-                    @libnotify@/bin/notify-send -i network-vpn "VPN Reconnected" \
-                    "VPN auto-reconnected successfully" 2>/dev/null || true
-            fi
-        done
-        exit 0
-    fi
-
-    DELAY=$((attempt * 3))
-    echo "Attempt $attempt failed, retrying in ${DELAY}s..."
-    sleep "$DELAY"
-done
-
-echo "VPN reconnect failed after 5 attempts"
-# Notify user of failure
-for uid in $(@systemd@/bin/loginctl list-users --no-legend | @gawk@/bin/awk '{print $1}'); do
-    RUNTIME_DIR="/run/user/$uid"
-    if [ -S "$RUNTIME_DIR/bus" ]; then
-        @sudo@/bin/sudo -u "#$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=$RUNTIME_DIR/bus" \
-            @libnotify@/bin/notify-send -i dialog-warning "VPN Reconnect Failed" \
-            "Auto-reconnect failed after 5 attempts. Please reconnect manually." 2>/dev/null || true
-    fi
-done
-exit 1
+exit "$overall_rc"

@@ -1826,10 +1826,7 @@ class PulseSSOPlugin(dbus.service.Object):
                     "Auth-dialog failed with non-transient error — stopping reconnection"
                 )
                 self._reconnection_pending = False
-                try:
-                    os.unlink("/run/vpn-auto-reconnect")
-                except FileNotFoundError:
-                    pass
+                self._clear_reconnect_flag()
                 self.StateChanged(ServiceState.Stopped)
                 self.Failure("VPN authentication cancelled or failed")
             return
@@ -2298,10 +2295,7 @@ class PulseSSOPlugin(dbus.service.Object):
                 self._reconnection_pending = False
 
                 # Remove auto-reconnect flag so external service does not retry
-                try:
-                    os.unlink("/run/vpn-auto-reconnect")
-                except FileNotFoundError:
-                    pass
+                self._clear_reconnect_flag()
 
                 self.cookie = None
                 self.gateway = None
@@ -2376,10 +2370,7 @@ class PulseSSOPlugin(dbus.service.Object):
                 self._disconnect_requested = True
 
                 # Remove auto-reconnect flag so external service does not retry
-                try:
-                    os.unlink("/run/vpn-auto-reconnect")
-                except FileNotFoundError:
-                    pass
+                self._clear_reconnect_flag()
 
                 # Cancel any pending re-activation timer
                 if self._reactivation_timeout_id is not None:
@@ -2525,7 +2516,7 @@ class PulseSSOPlugin(dbus.service.Object):
 
                 # Keep self.cookie / gateway / servercert / resolve so the
                 # re-activation reuses the cookie instead of re-prompting auth.
-                # Do NOT remove /run/vpn-auto-reconnect and do NOT quit.
+                # Do NOT clear this connection's reconnect flag and do NOT quit.
                 self.StateChanged(ServiceState.Stopped)
                 if self._reactivation_timeout_id is not None:
                     GLib.source_remove(self._reactivation_timeout_id)
@@ -2548,9 +2539,9 @@ class PulseSSOPlugin(dbus.service.Object):
 
             if in_quirk_window:
                 # Quirk-rescue budget exhausted — NM's state never settled.
-                # Cooperate with teardown but leave /run/vpn-auto-reconnect in
-                # place so the external vpn-auto-reconnect service / the user
-                # can still recover.
+                # Cooperate with teardown but leave this connection's reconnect
+                # flag in place so the external vpn-auto-reconnect service / the
+                # user can still recover.
                 logger.warning(
                     "Disconnect %.2fs after Starting but quirk-rescue budget "
                     "exhausted (%d) — giving up this cycle, leaving "
@@ -2578,10 +2569,7 @@ class PulseSSOPlugin(dbus.service.Object):
             self._disconnect_requested = True
 
             # Remove flag file so external service doesn't reconnect
-            try:
-                os.unlink("/run/vpn-auto-reconnect")
-            except FileNotFoundError:
-                pass
+            self._clear_reconnect_flag()
 
             # Cancel any pending auth
             self._cancel_direct_auth_timer()
@@ -2623,6 +2611,60 @@ class PulseSSOPlugin(dbus.service.Object):
             logger.info("Reactive disconnect (disconnect_requested) — stopping")
             self.StateChanged(ServiceState.Stopped)
             self.loop.quit()
+
+    @staticmethod
+    def _reconnect_flag_path(conn_uuid):
+        """Per-connection reconnect-flag path for a NM connection UUID, or None
+        if the value is not a canonical UUID.
+
+        SECURITY: we open()/unlink() this path as root, and _active_conn_uuid
+        comes straight from the D-Bus connection dict (any local caller can
+        reach Connect/Disconnect). Validating it as a real UUID here keeps a
+        crafted value like "../../../etc/shadow" from escaping the flag dir and
+        truncating/deleting an arbitrary file. NM's own UUIDs are already in
+        this canonical hex form, so this round-trips the legitimate value."""
+        import uuid as _uuidlib
+        try:
+            canon = str(_uuidlib.UUID(str(conn_uuid)))
+        except (ValueError, AttributeError, TypeError):
+            return None
+        return f"/run/vpn-auto-reconnect.d/{canon}"
+
+    def _set_reconnect_flag(self):
+        """Mark this connection as 'should be up' for the external
+        vpn-auto-reconnect service. Per-connection, keyed by NM UUID, so a
+        suspend/roam brings back exactly the connections that were active."""
+        path = self._reconnect_flag_path(self._active_conn_uuid)
+        if not path:
+            if self._active_conn_uuid:
+                logger.warning(
+                    "Refusing to set reconnect flag for non-UUID connection id: %r",
+                    self._active_conn_uuid,
+                )
+            return
+        try:
+            os.makedirs("/run/vpn-auto-reconnect.d", exist_ok=True)
+            with open(path, "w"):
+                pass
+        except OSError as e:
+            logger.debug("Could not set reconnect flag: %s", e)
+
+    def _clear_reconnect_flag(self):
+        """Remove this connection's auto-reconnect flag (user disconnect), so
+        the external service does not bring it back."""
+        path = self._reconnect_flag_path(self._active_conn_uuid)
+        try:
+            if path:
+                os.unlink(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.debug("Could not clear reconnect flag: %s", e)
+        # Legacy single global flag from older installs — remove if present.
+        try:
+            os.unlink("/run/vpn-auto-reconnect")
+        except (FileNotFoundError, OSError):
+            pass
 
     def _clear_cached_secrets(self):
         """Clear cached VPN secrets from NetworkManager via D-Bus."""
@@ -2769,6 +2811,9 @@ class PulseSSOPlugin(dbus.service.Object):
                 f.write(f"{int(time.time())}:{gw_ip}:{gw_dev}")
         except Exception:
             pass
+
+        # Mark this connection for external auto-reconnect (per-UUID flag).
+        self._set_reconnect_flag()
 
         # Notify user on re-activation (not on first connect)
         if self._is_reactivation:

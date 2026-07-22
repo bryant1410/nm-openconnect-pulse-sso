@@ -59,27 +59,73 @@ if [ -f "$CONF" ]; then
   # shellcheck disable=SC1090
   . "$CONF"
 fi
-# GATEWAY may also be supplied via the environment (sudo GATEWAY=... ./install.sh).
-if [ -z "${GATEWAY:-}" ]; then
-  die "GATEWAY is not set.
-  Copy the example and edit it (config.env is gitignored, so your gateway is never committed):
-      cp \"$SCRIPT_DIR/config.env.example\" \"$SCRIPT_DIR/config.env\"
-      \$EDITOR \"$SCRIPT_DIR/config.env\"
-  ...or pass it inline:  sudo GATEWAY=https://vpn.example.com/saml ./install.sh"
-fi
-VPN_NAME="${VPN_NAME:-Pulse VPN}"
 PROXY_PORT="${PROXY_PORT:-8443}"
 ENABLE_DTLS="${ENABLE_DTLS:-true}"
 VPN_MTU="${VPN_MTU:-1300}"
 ENABLE_RECOVERY="${ENABLE_RECOVERY:-true}"
 
-case "$VPN_NAME" in
-  *[!A-Za-z0-9\ ._-]*) die "VPN_NAME contains unsupported characters; use letters, digits, space, . _ -" ;;
-esac
+# --------------------------------------------------------------------------
+# Build the connection list.
+#
+# Two config styles (CONNECTIONS wins if both are present):
+#   - Single:    GATEWAY=... [VPN_NAME=...]   (also works inline: sudo GATEWAY=... ./install.sh)
+#   - Multiple:  CONNECTIONS="Name = URL <newline> Name2 = URL2"  (or ';'-separated)
+# --------------------------------------------------------------------------
+CONN_NAMES=()      # display name / nmcli id
+CONN_URLS=()       # full gateway URL (with path)
+CONN_HOSTS=()      # gateway hostname, parallel to CONN_NAMES/CONN_URLS
+UNIQUE_HOSTS=()    # de-duplicated gateway hostnames (for cert SANs + /etc/hosts)
 
-# Gateway hostname: strip scheme, path, and port (mirrors module.nix gateway-hostname)
-GATEWAY_HOST="${GATEWAY#*://}"; GATEWAY_HOST="${GATEWAY_HOST%%/*}"; GATEWAY_HOST="${GATEWAY_HOST%%:*}"
-[ -n "$GATEWAY_HOST" ] || die "Could not parse a hostname from GATEWAY='$GATEWAY'"
+_host_of() {  # url -> bare hostname (strip scheme, path, port; mirrors module.nix gateway-hostname)
+  local u="$1"; u="${u#*://}"; u="${u%%/*}"; u="${u%%:*}"; printf '%s' "$u"
+}
+
+add_connection() {  # name url
+  local name url host i u
+  name="$1"; url="$2"
+  # trim surrounding whitespace
+  name="${name#"${name%%[![:space:]]*}"}"; name="${name%"${name##*[![:space:]]}"}"
+  url="${url#"${url%%[![:space:]]*}"}";   url="${url%"${url##*[![:space:]]}"}"
+  [ -n "$name" ] || return 0
+  [ -n "$url" ]  || die "connection '$name' has no URL"
+  case "$name" in
+    *[!A-Za-z0-9\ ._-]*) die "connection name '$name' has unsupported characters; use letters, digits, space, . _ -" ;;
+  esac
+  host="$(_host_of "$url")"
+  [ -n "$host" ] || die "could not parse a hostname from URL '$url'"
+  for i in "${!CONN_NAMES[@]}"; do
+    [ "${CONN_NAMES[$i]}" = "$name" ] && die "duplicate connection name '$name'"
+  done
+  CONN_NAMES+=("$name"); CONN_URLS+=("$url"); CONN_HOSTS+=("$host")
+  for u in ${UNIQUE_HOSTS[@]+"${UNIQUE_HOSTS[@]}"}; do
+    [ "$u" = "$host" ] && return 0
+  done
+  UNIQUE_HOSTS+=("$host")
+}
+
+if [ -n "${CONNECTIONS:-}" ]; then
+  # Split on ';' and newlines; each non-empty entry is "Name = URL".
+  while IFS= read -r _line; do
+    case "$_line" in ''|'#'*) continue ;; esac
+    case "$_line" in *=*) ;; *) die "CONNECTIONS entry is not 'Name = URL': $_line" ;; esac
+    add_connection "${_line%%=*}" "${_line#*=}"
+  done <<EOF
+$(printf '%s\n' "$CONNECTIONS" | tr ';' '\n')
+EOF
+  [ "${#CONN_NAMES[@]}" -gt 0 ] || die "CONNECTIONS is set but no valid 'Name = URL' entries were parsed"
+elif [ -n "${GATEWAY:-}" ]; then
+  add_connection "${VPN_NAME:-Pulse VPN}" "$GATEWAY"
+else
+  die "Neither CONNECTIONS nor GATEWAY is set.
+  Copy the example and edit it (config.env is gitignored, so your gateway is never committed):
+      cp \"$SCRIPT_DIR/config.env.example\" \"$SCRIPT_DIR/config.env\"
+      \$EDITOR \"$SCRIPT_DIR/config.env\"
+  ...or pass it inline:  sudo GATEWAY=https://vpn.example.com/saml ./install.sh"
+fi
+
+# Primary name (first connection): status messages, the @vpnName@ substitution
+# in recovery scripts, and single-connection back-compat with uninstall.sh.
+VPN_NAME="${CONN_NAMES[0]}"
 
 # Locate vpnc-script (baked into the helper wrapper as VPNC_SCRIPT)
 VPNC_SCRIPT_PATH=""
@@ -92,9 +138,10 @@ CERTUTIL="$(command -v certutil || true)"
 TARGET_USER="${SUDO_USER:-}"
 
 msg "Configuration"
-ok "gateway URL : $GATEWAY"
-ok "gateway host: $GATEWAY_HOST"
-ok "connection  : $VPN_NAME"
+for i in "${!CONN_NAMES[@]}"; do
+  ok "connection  : ${CONN_NAMES[$i]}  ->  ${CONN_URLS[$i]}"
+done
+ok "gateway host(s): ${UNIQUE_HOSTS[*]}"
 ok "proxy port  : $PROXY_PORT"
 ok "DTLS        : $ENABLE_DTLS    MTU: ${VPN_MTU:-<server default>}    recovery: $ENABLE_RECOVERY"
 ok "vpnc-script : $VPNC_SCRIPT_PATH"
@@ -130,20 +177,38 @@ ok "all dependencies present"
 msg "Local PKI ($PKI)"
 install -d -m755 "$CONFIG_DIR"
 install -d -m755 "$PKI"
-if [ "${FORCE_PKI:-0}" = 1 ] || [ ! -s "$PKI/ca.crt" ] || [ ! -s "$PKI/server.crt" ]; then
+# One server cert covers every gateway host via SANs. CN = first host.
+CERT_CN="${UNIQUE_HOSTS[0]}"
+SAN=""
+for h in "${UNIQUE_HOSTS[@]}"; do SAN="${SAN:+$SAN,}DNS:$h"; done
+
+# (Re)generate the CA only when missing or forced — its stability is what keeps
+# the browser trust anchor valid across re-runs.
+regen_server=0
+if [ "${FORCE_PKI:-0}" = 1 ] || [ ! -s "$PKI/ca.crt" ] || [ ! -s "$PKI/ca.key" ]; then
   openssl genrsa -out "$PKI/ca.key" 2048 2>/dev/null
   openssl req -new -x509 -days 3650 -key "$PKI/ca.key" -out "$PKI/ca.crt" \
     -subj "/CN=Pulse Browser Auth Local CA" 2>/dev/null
+  regen_server=1
+  ok "generated local CA"
+fi
+
+# (Re)generate the server cert when missing, forced, or the SAN set changed
+# (e.g. a connection on a new host was added) — so re-running install.sh after
+# editing CONNECTIONS just works.
+if [ "$regen_server" = 1 ] || [ ! -s "$PKI/server.crt" ] \
+   || [ ! -f "$PKI/san.txt" ] || [ "$(cat "$PKI/san.txt" 2>/dev/null)" != "$SAN" ]; then
   openssl genrsa -out "$PKI/server.key" 2048 2>/dev/null
   openssl req -new -key "$PKI/server.key" -out "$PKI/server.csr" \
-    -subj "/CN=$GATEWAY_HOST" 2>/dev/null
+    -subj "/CN=$CERT_CN" 2>/dev/null
   openssl x509 -req -days 3650 -in "$PKI/server.csr" \
     -CA "$PKI/ca.crt" -CAkey "$PKI/ca.key" -CAcreateserial -out "$PKI/server.crt" \
-    -extfile <(printf 'subjectAltName=DNS:%s\n' "$GATEWAY_HOST") 2>/dev/null
+    -extfile <(printf 'subjectAltName=%s\n' "$SAN") 2>/dev/null
   rm -f "$PKI/server.csr"
-  ok "generated CA + server cert (SAN=$GATEWAY_HOST)"
+  printf '%s' "$SAN" > "$PKI/san.txt"
+  ok "generated server cert (SAN=$SAN)"
 else
-  ok "keeping existing CA/cert (FORCE_PKI=1 to regenerate)"
+  ok "keeping existing CA/cert (SAN=$SAN; FORCE_PKI=1 to regenerate)"
 fi
 # The MITM proxy runs as the DESKTOP USER (auth-dialog launches it via
 # `systemd-run --user`), so it MUST be able to read the server cert+key.
@@ -265,12 +330,12 @@ tmp_hosts="$(mktemp)"
 sed "/^${HOSTS_BEGIN//\//\\/}$/,/^${HOSTS_END//\//\\/}$/d" /etc/hosts > "$tmp_hosts"
 {
   echo "$HOSTS_BEGIN"
-  echo "127.0.0.1 $GATEWAY_HOST"
+  for h in "${UNIQUE_HOSTS[@]}"; do echo "127.0.0.1 $h"; done
   echo "$HOSTS_END"
 } >> "$tmp_hosts"
 install -m644 "$tmp_hosts" /etc/hosts
 rm -f "$tmp_hosts"
-ok "$GATEWAY_HOST -> 127.0.0.1"
+ok "${UNIQUE_HOSTS[*]} -> 127.0.0.1"
 
 # --------------------------------------------------------------------------
 # Permanent NAT redirect 127.0.0.1:443 -> :PROXY_PORT (mirrors module.nix:655)
@@ -332,8 +397,10 @@ if [ "$ENABLE_RECOVERY" = "true" ]; then
   ok "installed NM dispatcher 90-vpn-reconnect"
 
   # vpnc hooks (run by vpnc-script from /etc/vpnc/{post-connect,reconnect}.d)
+  # NOTE: the auto-reconnect flag is now written by the D-Bus service itself
+  # (per-connection, keyed by UUID) — see nm-pulse-sso-service.py — so the old
+  # post-connect-auto-reconnect-flag.sh hook is intentionally not installed.
   install -d -m755 "$VPNC_PC" "$VPNC_RC"
-  subst_script "$REPO_DIR/scripts/vpnc/post-connect-auto-reconnect-flag.sh" "$VPNC_PC/00-auto-reconnect-flag" 755
   subst_script "$REPO_DIR/scripts/vpnc/post-connect-default-route.sh"       "$VPNC_PC/add-default-route"       755
   subst_script "$REPO_DIR/scripts/vpnc/post-connect-narrow-docker.sh"       "$VPNC_PC/narrow-docker-route"     755
   subst_script "$REPO_DIR/scripts/vpnc/post-connect-flush-dns.sh"           "$VPNC_PC/flush-dns"               755
@@ -398,26 +465,31 @@ else
 fi
 
 # --------------------------------------------------------------------------
-# NetworkManager connection profile (keyfile; mirrors module.nix:531)
+# NetworkManager connection profiles (keyfiles; mirrors module.nix:531)
 # --------------------------------------------------------------------------
-msg "NetworkManager connection profile"
-CONN_FILE="$NM_CONN_DIR/${VPN_NAME}.nmconnection"
-CONN_UUID="$(cat "$NM_CONN_DIR/.pulse-sso-uuid" 2>/dev/null || true)"
-if [ -z "$CONN_UUID" ]; then
-  CONN_UUID="$(/usr/bin/python3 -c 'import uuid; print(uuid.uuid4())')"
-  printf '%s' "$CONN_UUID" > "$NM_CONN_DIR/.pulse-sso-uuid" 2>/dev/null || true
-fi
+msg "NetworkManager connection profile(s)"
 install -d -m755 "$NM_CONN_DIR"
-cat > "$CONN_FILE" <<EOF
+OURS="service-type=org.freedesktop.NetworkManager.pulse-sso"
+for i in "${!CONN_NAMES[@]}"; do
+  name="${CONN_NAMES[$i]}"; url="${CONN_URLS[$i]}"
+  conn_file="$NM_CONN_DIR/${name}.nmconnection"
+  # Reuse the existing UUID for this name if the keyfile is one of ours, so NM
+  # keeps favourites/autoconnect across re-runs; otherwise mint a fresh one.
+  uuid=""
+  if [ -f "$conn_file" ] && grep -q "$OURS" "$conn_file"; then
+    uuid="$(sed -n 's/^uuid=//p' "$conn_file" | head -1)"
+  fi
+  [ -n "$uuid" ] || uuid="$(/usr/bin/python3 -c 'import uuid; print(uuid.uuid4())')"
+  cat > "$conn_file" <<EOF
 [connection]
-id=$VPN_NAME
-uuid=$CONN_UUID
+id=$name
+uuid=$uuid
 type=vpn
 autoconnect=false
 
 [vpn]
 service-type=org.freedesktop.NetworkManager.pulse-sso
-gateway=$GATEWAY
+gateway=$url
 persistent=true
 
 [ipv4]
@@ -426,9 +498,12 @@ method=auto
 [ipv6]
 method=auto
 EOF
-chmod 600 "$CONN_FILE"
-chown root:root "$CONN_FILE"
-ok "wrote $CONN_FILE"
+  chmod 600 "$conn_file"
+  chown root:root "$conn_file"
+  ok "wrote $conn_file"
+done
+# Legacy single-UUID marker (superseded by per-keyfile UUIDs) — clean it up.
+rm -f "$NM_CONN_DIR/.pulse-sso-uuid"
 
 # --------------------------------------------------------------------------
 # Activate
@@ -441,11 +516,18 @@ ok "reloaded D-Bus policy and restarted NetworkManager"
 
 echo
 msg "Done."
+echo
+if [ "${#CONN_NAMES[@]}" -eq 1 ]; then
+  echo "Connect with:"
+  echo "    nmcli connection up \"${CONN_NAMES[0]}\""
+  echo "  (or pick \"${CONN_NAMES[0]}\" from the GNOME/KDE network menu)"
+else
+  echo "Connect with one of (or pick it from the GNOME/KDE network menu):"
+  for i in "${!CONN_NAMES[@]}"; do
+    echo "    nmcli connection up \"${CONN_NAMES[$i]}\""
+  done
+fi
 cat <<EOF
-
-Connect with:
-    nmcli connection up "$VPN_NAME"
-  (or pick "$VPN_NAME" from the GNOME/KDE network menu)
 
 Your default browser will open the gateway for SSO. After you finish signing in,
 the tab can be closed and the tunnel comes up.

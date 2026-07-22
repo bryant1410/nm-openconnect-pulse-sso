@@ -42,7 +42,8 @@ esac
 # Check VPN state: is openconnect running? Should VPN be up?
 OPENCONNECT_PID=$(@procps@/bin/pgrep -x openconnect)
 VPN_SHOULD_BE_UP=""
-if [ -f "/run/vpn-auto-reconnect" ]; then
+if { [ -d "/run/vpn-auto-reconnect.d" ] && [ -n "$(ls -A /run/vpn-auto-reconnect.d 2>/dev/null)" ]; } \
+   || [ -f "/run/vpn-auto-reconnect" ]; then
     VPN_SHOULD_BE_UP="1"
 fi
 

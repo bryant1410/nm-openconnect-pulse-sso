@@ -37,16 +37,26 @@ VPN_NAME="Pulse VPN"; PROXY_PORT="8443"
 [ -f "$SCRIPT_DIR/config.env" ] && . "$SCRIPT_DIR/config.env"
 TARGET_USER="${SUDO_USER:-}"
 
-msg "Bringing down and removing the VPN connection"
-nmcli connection down "$VPN_NAME" >/dev/null 2>&1 || true
-nmcli connection delete "$VPN_NAME" >/dev/null 2>&1 || true
-# Remove any keyfile that references our service-type, plus the uuid marker.
+msg "Bringing down and removing the VPN connection(s)"
+# Enumerate every keyfile that references our service-type and down+delete+remove
+# it, so ALL configured connections go regardless of what config.env now says.
 if [ -d "$NM_CONN_DIR" ]; then
   grep -rl "service-type=org.freedesktop.NetworkManager.pulse-sso" "$NM_CONN_DIR" 2>/dev/null \
-    | while IFS= read -r f; do rm -f "$f"; done
+    | while IFS= read -r f; do
+        cuuid="$(sed -n 's/^uuid=//p' "$f" | head -1)"
+        cid="$(sed -n 's/^id=//p' "$f" | head -1)"
+        if [ -n "$cuuid" ]; then
+          nmcli connection down uuid "$cuuid"   >/dev/null 2>&1 || true
+          nmcli connection delete uuid "$cuuid" >/dev/null 2>&1 || true
+        elif [ -n "$cid" ]; then
+          nmcli connection down "$cid"   >/dev/null 2>&1 || true
+          nmcli connection delete "$cid" >/dev/null 2>&1 || true
+        fi
+        rm -f "$f"
+      done
   rm -f "$NM_CONN_DIR/.pulse-sso-uuid"
 fi
-ok "connection removed"
+ok "connection(s) removed"
 
 msg "Removing NAT redirect + reconnect services"
 systemctl disable --now nm-pulse-sso-browser-auth-redirect.service >/dev/null 2>&1 || true
@@ -63,7 +73,8 @@ rm -f "$SLEEP_HOOK" "$DISPATCHER" "$SYSCTL_FILE"
 rm -f "$VPNC_PC/00-auto-reconnect-flag" "$VPNC_PC/add-default-route" \
       "$VPNC_PC/narrow-docker-route" "$VPNC_PC/flush-dns" \
       "$VPNC_RC/fix-default-route" "$VPNC_RC/narrow-docker-route" "$VPNC_RC/flush-dns"
-rm -f /run/vpn-auto-reconnect /run/vpn-last-connect /run/vpn-reconnect-last-kill
+rm -rf /run/vpn-auto-reconnect.d
+rm -f /run/vpn-auto-reconnect /run/vpn-auto-reconnect.lock /run/vpn-last-connect /run/vpn-reconnect-last-kill
 # Restore rp_filter to its captured pre-install value. (A previous version
 # forced =1, which is STRICTER than Ubuntu's 2/loose default and dropped
 # asymmetrically-routed VPN return traffic until the next reboot.)
