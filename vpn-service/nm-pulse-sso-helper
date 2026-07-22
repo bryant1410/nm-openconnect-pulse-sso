@@ -457,4 +457,20 @@ def main():
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        # openconnect owns the stdout/stderr pipes this --script helper writes
+        # to. When openconnect is torn down mid-run (user disconnect, reconnect
+        # race, SIGKILL), our next write gets EPIPE -> BrokenPipeError. The
+        # tunnel is going away regardless, so exit quietly instead of letting
+        # Python print a traceback that Ubuntu's apport uploads as a crash
+        # report. Redirect the std streams to /dev/null first so interpreter
+        # shutdown doesn't re-trigger EPIPE flushing buffered output.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+            os.dup2(devnull, sys.stderr.fileno())
+        except Exception:
+            pass
+        os._exit(0)
