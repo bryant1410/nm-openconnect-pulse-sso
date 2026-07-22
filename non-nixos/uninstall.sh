@@ -29,6 +29,7 @@ HOSTS_END="# nm-pulse-sso END"
 
 msg()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 ok()   { printf '  \033[1;32m✓\033[0m %s\n' "$*"; }
+warn() { printf '  \033[1;33m!\033[0m %s\n' "$*" >&2; }
 
 [ "$(id -u)" -eq 0 ] || { echo "Run as root: sudo ./uninstall.sh" >&2; exit 1; }
 
@@ -38,23 +39,43 @@ VPN_NAME="Pulse VPN"; PROXY_PORT="8443"
 TARGET_USER="${SUDO_USER:-}"
 
 msg "Bringing down and removing the VPN connection(s)"
-# Enumerate every keyfile that references our service-type and down+delete+remove
-# it, so ALL configured connections go regardless of what config.env now says.
+OURS="org.freedesktop.NetworkManager.pulse-sso"
+NETPLAN_HIT=0
+# Backend-agnostic removal via nmcli. The old code scanned only
+# /etc/NetworkManager/system-connections/ keyfiles — but on netplan-backed
+# systems (Ubuntu) NM stores our connection as /etc/netplan/90-NM-<uuid>.yaml
+# and renders it to /run/NetworkManager/system-connections/netplan-NM-*. That
+# keyfile scan never saw it, which is why "Pulse VPN" survived uninstall.
+# Enumerating via nmcli catches every backend; we only ever match OUR
+# service-type, so a coexisting stock nm-openconnect VPN is left untouched.
+if command -v nmcli >/dev/null 2>&1; then
+  while IFS= read -r cuuid; do
+    [ -n "$cuuid" ] || continue
+    [ "$(nmcli -g vpn.service-type connection show "$cuuid" 2>/dev/null)" = "$OURS" ] || continue
+    cfn="$(nmcli -g GENERAL.FILENAME connection show "$cuuid" 2>/dev/null)"
+    nmcli connection down   uuid "$cuuid" >/dev/null 2>&1 || true
+    nmcli connection delete uuid "$cuuid" >/dev/null 2>&1 || true
+    ok "removed connection $cuuid"
+    case "$cfn" in
+      *netplan*)
+        NETPLAN_HIT=1
+        # nmcli delete asks netplan to drop its yaml on integrated systems,
+        # but remove the exact source too as a backstop.
+        rm -f "/etc/netplan/90-NM-$cuuid.yaml"
+        ;;
+    esac
+  done <<EOF
+$(nmcli -t -f UUID,TYPE connection show 2>/dev/null | awk -F: '$2=="vpn"{print $1}')
+EOF
+fi
+# Belt-and-suspenders: any leftover /etc keyfiles that reference our service-type.
 if [ -d "$NM_CONN_DIR" ]; then
-  grep -rl "service-type=org.freedesktop.NetworkManager.pulse-sso" "$NM_CONN_DIR" 2>/dev/null \
-    | while IFS= read -r f; do
-        cuuid="$(sed -n 's/^uuid=//p' "$f" | head -1)"
-        cid="$(sed -n 's/^id=//p' "$f" | head -1)"
-        if [ -n "$cuuid" ]; then
-          nmcli connection down uuid "$cuuid"   >/dev/null 2>&1 || true
-          nmcli connection delete uuid "$cuuid" >/dev/null 2>&1 || true
-        elif [ -n "$cid" ]; then
-          nmcli connection down "$cid"   >/dev/null 2>&1 || true
-          nmcli connection delete "$cid" >/dev/null 2>&1 || true
-        fi
-        rm -f "$f"
-      done
+  grep -rl "service-type=$OURS" "$NM_CONN_DIR" 2>/dev/null \
+    | while IFS= read -r f; do rm -f "$f"; done
   rm -f "$NM_CONN_DIR/.pulse-sso-uuid"
+fi
+if [ "$NETPLAN_HIT" = 1 ] && command -v netplan >/dev/null 2>&1; then
+  netplan apply >/dev/null 2>&1 || true
 fi
 ok "connection(s) removed"
 
@@ -118,3 +139,11 @@ ok "done"
 echo
 echo "Uninstalled. The browser profile at ~/.cache/pulse-browser-auth was left in place;"
 echo "remove it yourself if you want a fully clean slate."
+if [ "$NETPLAN_HIT" = 1 ]; then
+  echo
+  warn "One or more connections were netplan-backed and have been removed."
+  warn "If a 'Pulse VPN' reappears after reboot, something is re-rendering it"
+  warn "(a file under /etc/netplan, or corporate config management). Check:"
+  warn "    nmcli -f NAME,UUID,FILENAME connection show | grep -i pulse"
+  warn "    ls -l /etc/netplan/90-NM-*.yaml"
+fi

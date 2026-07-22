@@ -469,17 +469,46 @@ fi
 # --------------------------------------------------------------------------
 msg "NetworkManager connection profile(s)"
 install -d -m755 "$NM_CONN_DIR"
-OURS="service-type=org.freedesktop.NetworkManager.pulse-sso"
+SVC="org.freedesktop.NetworkManager.pulse-sso"
+
+# We manage our connections AUTHORITATIVELY: exactly one per desired name, no
+# duplicates or stale leftovers. This must be backend-agnostic, because on
+# netplan-backed NM (Ubuntu) a keyfile written to /etc is migrated by NM into
+# /etc/netplan/90-NM-<uuid>.yaml (rendered to /run/...netplan-NM-*). The old
+# "reuse the UUID if <name>.nmconnection exists in /etc" logic then failed to
+# find it next run and minted a second UUID -> two same-named "Pulse VPN"
+# profiles, which makes `nmcli connection up "Pulse VPN"` ambiguous and breaks
+# reconnect. So: first delete EVERY existing connection of our service-type
+# (any backend) via nmcli, then write exactly the desired keyfiles fresh.
+# Only our service-type is touched — a coexisting stock nm-openconnect VPN to
+# the same gateway is left alone.
+if command -v nmcli >/dev/null 2>&1; then
+  while IFS= read -r cuuid; do
+    [ -n "$cuuid" ] || continue
+    [ "$(nmcli -g vpn.service-type connection show "$cuuid" 2>/dev/null)" = "$SVC" ] || continue
+    cid="$(nmcli -g connection.id connection show "$cuuid" 2>/dev/null)"
+    cfn="$(nmcli -g GENERAL.FILENAME connection show "$cuuid" 2>/dev/null)"
+    nmcli connection down   uuid "$cuuid" >/dev/null 2>&1 || true
+    nmcli connection delete uuid "$cuuid" >/dev/null 2>&1 || true
+    case "$cfn" in *netplan*) rm -f "/etc/netplan/90-NM-$cuuid.yaml" ;; esac
+    ok "cleared existing pulse-sso connection '${cid:-$cuuid}'"
+  done <<EOF
+$(nmcli -t -f UUID,TYPE connection show 2>/dev/null | awk -F: '$2=="vpn"{print $1}')
+EOF
+fi
+# Belt-and-suspenders: drop any leftover /etc keyfiles of our service-type.
+# `|| true` because grep exits 1 when there are no matches (the common case
+# once connections live in netplan), which would trip `set -o pipefail`.
+{ grep -rl "service-type=$SVC" "$NM_CONN_DIR" 2>/dev/null || true; } \
+  | while IFS= read -r f; do rm -f "$f"; done
+# Legacy single-UUID marker (superseded by per-keyfile UUIDs) — clean it up.
+rm -f "$NM_CONN_DIR/.pulse-sso-uuid"
+
+# Write exactly one keyfile per desired connection with a fresh UUID.
 for i in "${!CONN_NAMES[@]}"; do
   name="${CONN_NAMES[$i]}"; url="${CONN_URLS[$i]}"
   conn_file="$NM_CONN_DIR/${name}.nmconnection"
-  # Reuse the existing UUID for this name if the keyfile is one of ours, so NM
-  # keeps favourites/autoconnect across re-runs; otherwise mint a fresh one.
-  uuid=""
-  if [ -f "$conn_file" ] && grep -q "$OURS" "$conn_file"; then
-    uuid="$(sed -n 's/^uuid=//p' "$conn_file" | head -1)"
-  fi
-  [ -n "$uuid" ] || uuid="$(/usr/bin/python3 -c 'import uuid; print(uuid.uuid4())')"
+  uuid="$(/usr/bin/python3 -c 'import uuid; print(uuid.uuid4())')"
   cat > "$conn_file" <<EOF
 [connection]
 id=$name
@@ -488,7 +517,7 @@ type=vpn
 autoconnect=false
 
 [vpn]
-service-type=org.freedesktop.NetworkManager.pulse-sso
+service-type=$SVC
 gateway=$url
 persistent=true
 
@@ -502,8 +531,6 @@ EOF
   chown root:root "$conn_file"
   ok "wrote $conn_file"
 done
-# Legacy single-UUID marker (superseded by per-keyfile UUIDs) — clean it up.
-rm -f "$NM_CONN_DIR/.pulse-sso-uuid"
 
 # --------------------------------------------------------------------------
 # Activate
